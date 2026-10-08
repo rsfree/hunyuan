@@ -32,6 +32,7 @@ yuanbao_openai_proxy.py — 腾讯元宝 (yuanbao.tencent.com) → OpenAI API �
 import os
 import re
 import json
+import asyncio
 import time
 import uuid
 import subprocess
@@ -1107,6 +1108,152 @@ async def login_page(req: Request):
                     b64 = msg["result"]["data"]
                     return Response(content=base64.b64decode(b64), media_type="image/png")
             return JSONResponse({"error": "截图超时"}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+
+
+JS_PHONE_SEND = """
+(async (p) => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const setVal = (el, v) => {
+    const proto = el.tagName === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, v);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  };
+  const byText = (txt, exact) => [...document.querySelectorAll('*')]
+    .filter(e => e.offsetWidth > 0 && e.children.length <= 2)
+    .filter(e => { const t = (e.textContent || '').trim(); return exact ? t === txt : t.startsWith(txt); })
+    .sort((a, b) => (a.offsetWidth * a.offsetHeight) - (b.offsetWidth * b.offsetHeight))[0];
+
+  // 0) 若登录弹窗未开，先点 Log In 打开
+  if (!document.querySelector('.hyc-phone-login')) {
+    const loginBtn = byText('Log In');
+    if (loginBtn) { loginBtn.click(); await sleep(1500); }
+    const phoneTab = byText('Phone', true);
+    if (phoneTab && !document.querySelector('.hyc-phone-login')) { phoneTab.click(); await sleep(1500); }
+  }
+  if (!document.querySelector('.hyc-phone-login')) return {ok: false, step: 'open_modal', msg: '登录弹窗未出现'};
+
+  // 1) 切区号
+  const areaEl = document.querySelector('.yuanbao-oversea-input__wrap__formitem__areaCode');
+  if (areaEl && !areaEl.textContent.includes(p.area.replace('+', ''))) {
+    areaEl.click();
+    await sleep(800);
+    const opt = byText(p.area, false);
+    if (!opt) return {ok: false, step: 'area', msg: '未找到区号 ' + p.area};
+    opt.click();
+    await sleep(500);
+  }
+  const areaNow = (document.querySelector('.yuanbao-oversea-input__wrap__formitem__areaCode') || {}).textContent || '';
+
+  // 2) 填手机号
+  const tel = document.querySelector('.hyc-phone-login input[type=tel]') || document.querySelector('input[type=tel]');
+  if (!tel) return {ok: false, step: 'phone_input', msg: '手机号输入框未找到'};
+  setVal(tel, p.phone);
+  await sleep(300);
+
+  // 3) 勾协议（如未勾）
+  const cb = document.querySelector('.hyc-phone-login .t-checkbox__former') || document.querySelector('.t-checkbox__former');
+  if (cb && !cb.checked) {
+    const boxLabel = cb.closest('.t-checkbox');
+    (boxLabel || cb).click();
+    await sleep(300);
+  }
+
+  // 4) dry_run：到此为止（不点发送）
+  if (p.dry_run) return {ok: true, dry_run: true, area: areaNow.trim(),
+    phone_filled: !!(tel.value), agree_checked: !!(cb && cb.checked)};
+  const send = document.querySelector('a.hyc-phone-login__send-code');
+  if (!send) return {ok: false, step: 'send_btn', msg: 'Send 按钮未找到'};
+  send.click();
+  await sleep(2500);
+
+  // 5) 读校验结果（Toast / 按钮态）
+  const toast = [...document.querySelectorAll('[class*=toast],[class*=message],[class*=Toast]')]
+    .filter(e => e.offsetWidth > 0).map(e => (e.textContent || '').trim()).filter(Boolean)[0] || '';
+  const sendTxt = (document.querySelector('a.hyc-phone-login__send-code') || {}).textContent || '';
+  const err = [...document.querySelectorAll('[class*=error],[class*=tip]')]
+    .filter(e => e.offsetWidth > 0).map(e => (e.textContent || '').trim()).filter(t => t && t.length < 60)[0] || '';
+  return {ok: true, area: areaNow.trim(), phone: p.phone, send_text: sendTxt.trim(), toast, err};
+})
+"""
+
+JS_PHONE_VERIFY = """
+(async (p) => {
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+  const setVal = (el, v) => {
+    const proto = el.tagName === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+    setter.call(el, v);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+    el.dispatchEvent(new Event('change', {bubbles: true}));
+  };
+  const codeInput = document.querySelector('.hyc-phone-login input[type=number]')
+    || [...document.querySelectorAll('input')].find(e => (e.placeholder || '').toLowerCase().includes('verification'));
+  if (!codeInput) return {ok: false, step: 'code_input', msg: '验证码输入框未找到'};
+  setVal(codeInput, p.code);
+  await sleep(300);
+  const btn = document.querySelector('button.hyc-phone-login__btn');
+  if (!btn) return {ok: false, step: 'submit_btn', msg: 'Log In 按钮未找到'};
+  btn.click();
+  await sleep(4000);
+  const loggedIn = !document.querySelector('.hyc-phone-login') && !document.body.innerText.includes('Not logged in');
+  const toast = [...document.querySelectorAll('[class*=toast],[class*=message],[class*=Toast]')]
+    .filter(e => e.offsetWidth > 0).map(e => (e.textContent || '').trim()).filter(Boolean)[0] || '';
+  return {ok: true, logged_in: loggedIn, toast};
+})
+"""
+
+@app.post("/login/phone/send")
+async def login_phone_send(req: Request):
+    """香港/大陆手机号接码登录 —— 第一步：切区号 + 填号 + 点发送验证码。"""
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    phone = str(body.get("phone", "")).strip()
+    area = str(body.get("area", "+852")).strip()
+    if not phone:
+        return JSONResponse({"error": "缺少 phone（本地号，不含区号）"}, status_code=400)
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    dry_run = bool(body.get("dry_run"))
+    js = f"({JS_PHONE_SEND})({json.dumps({'phone': phone, 'area': area, 'dry_run': dry_run})})"
+    try:
+        r = await asyncio.to_thread(m.evaluate, js, 60)  # evaluate 内部自带锁，勿在外层重复抢锁（跨线程死锁）
+        return {"result": r, "hint": "验证码已触发（若 send_text 计数中即已发出）；收到后 POST /login/phone/verify {code}"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+
+
+@app.post("/login/phone/verify")
+async def login_phone_verify(req: Request):
+    """接码登录 —— 第二步：填验证码 + 提交，成功即持久化到容器 profile。"""
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    code = str(body.get("code", "")).strip()
+    if not code:
+        return JSONResponse({"error": "缺少 code"}, status_code=400)
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    js = f"({JS_PHONE_VERIFY})({json.dumps({'code': code})})"
+    try:
+        r = await asyncio.to_thread(m.evaluate, js, 60)
+        return {"result": r, "hint": "logged_in=true 即登录成功（登录态持久化在容器 chrome-profile）"}
     except Exception as e:
         return JSONResponse({"error": str(e)[:200]}, status_code=502)
 

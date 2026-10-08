@@ -1258,6 +1258,329 @@ async def login_phone_verify(req: Request):
         return JSONResponse({"error": str(e)[:200]}, status_code=502)
 
 
+import json
+import os
+
+ADMIN_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>元宝账号管理</title>
+<style>
+  :root { --bg:#faf9f7; --card:#fff; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; --ok:#3B6D11; --warn:#854F0B; --err:#A32D2D; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:18px; font-weight:500; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(340px,1fr)); gap:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:14px; font-weight:500; margin:0 0 12px; display:flex; align-items:center; gap:8px; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .badge.ok { color:var(--ok); border-color:var(--ok); }
+  .badge.err { color:var(--err); border-color:var(--err); }
+  .badge.warn { color:var(--warn); border-color:var(--warn); }
+  label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  input, select, button { font:13px inherit; }
+  input, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; background:#fff; color:var(--text); }
+  button { margin-top:12px; padding:8px 14px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:8px; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .row { display:flex; gap:8px; align-items:flex-end; }
+  .row > div { flex:1; }
+  .msg { margin-top:10px; font-size:12px; min-height:18px; }
+  .msg.ok { color:var(--ok); } .msg.err { color:var(--err); } .msg.warn { color:var(--warn); }
+  #shot { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:12px; display:block; background:#fff; }
+  .muted { color:var(--muted); font-size:12px; }
+  code { background:#f1efe8; padding:1px 5px; border-radius:4px; font-size:12px; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  td, th { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); }
+  a { color:var(--accent); }
+</style>
+</head>
+<body>
+<h1>元宝账号管理</h1>
+<div class="sub">单实例自管理 · <span id="whoami">...</span></div>
+
+<div class="grid">
+  <div class="card">
+    <h2>访问凭证 <span class="badge" id="keyBadge">未设置</span></h2>
+    <label>门禁 Key（浏览器本地保存，不上传）</label>
+    <input id="key" type="password" placeholder="sk-yuanbao-...">
+    <button onclick="saveKey()">保存并检测</button>
+    <div class="msg" id="keyMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>服务状态 <span class="badge" id="svcBadge">待检测</span></h2>
+    <table id="svcTable"><tr><td class="muted">保存 Key 后自动检测</td></tr></table>
+    <button class="ghost" onclick="probe()">重新探活</button>
+    <div class="msg" id="svcMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>手机号接码登录 <span class="badge" id="phBadge">香港 +852</span></h2>
+    <div class="row">
+      <div style="max-width:110px">
+        <label>区号</label>
+        <select id="area"><option value="+852">+852 中国香港</option><option value="+86">+86 中国大陆</option></select>
+      </div>
+      <div>
+        <label>手机号（不含区号）</label>
+        <input id="phone" placeholder="例如 98765432">
+      </div>
+    </div>
+    <div class="row">
+      <button id="sendBtn" onclick="sendCode()">发送验证码</button>
+      <div style="flex:1">
+        <label>验证码</label>
+        <input id="code" placeholder="6 位数字">
+      </div>
+    </div>
+    <button onclick="verifyCode()">提交登录</button>
+    <div class="msg" id="phMsg"></div>
+  </div>
+
+  <div class="card">
+    <h2>当前页面（扫码 / 状态）<span class="badge" id="shotBadge">-</span></h2>
+    <img id="shot" alt="页面截图">
+    <button class="ghost" onclick="loadShot()">刷新截图</button>
+    <div class="muted" style="margin-top:8px">未登录时此处显示登录二维码；也可切换上方接码登录。</div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let KEY = localStorage.getItem('yb_key') || '';
+$('key').value = KEY;
+
+function authHeaders() { return { 'Authorization': 'Bearer ' + KEY, 'content-type': 'application/json' }; }
+function setMsg(el, text, cls) { const e = $(el); e.textContent = text; e.className = 'msg ' + (cls || ''); }
+
+function saveKey() {
+  KEY = $('key').value.trim();
+  localStorage.setItem('yb_key', KEY);
+  $('keyBadge').textContent = KEY ? '已保存' : '未设置';
+  $('keyBadge').className = 'badge ' + (KEY ? 'ok' : '');
+  probe(); loadShot();
+}
+
+async function probe() {
+  if (!KEY) return setMsg('svcMsg', '先设置 Key', 'warn');
+  $('svcBadge').textContent = '检测中';
+  try {
+    const t0 = Date.now();
+    const r = await fetch('/v1/models', { headers: authHeaders() });
+    const ms = Date.now() - t0;
+    if (r.status === 401) { $('svcBadge').textContent = 'Key 无效'; $('svcBadge').className = 'badge err'; return setMsg('svcMsg', '门禁 Key 被拒绝（401）', 'err'); }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    $('svcBadge').textContent = '在线'; $('svcBadge').className = 'badge ok';
+    $('svcTable').innerHTML = '<tr><th>模型</th><td>' + d.data.map(m => m.id).join('、') + '</td></tr>'
+      + '<tr><th>延迟</th><td>' + ms + ' ms</td></tr>';
+    setMsg('svcMsg', '服务正常', 'ok');
+  } catch (e) {
+    $('svcBadge').textContent = '异常'; $('svcBadge').className = 'badge err';
+    setMsg('svcMsg', String(e), 'err');
+  }
+}
+
+async function loadShot() {
+  if (!KEY) return;
+  $('shotBadge').textContent = '加载中';
+  try {
+    const r = await fetch('/login', { headers: { 'Authorization': 'Bearer ' + KEY } });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const b = await r.blob();
+    $('shot').src = URL.createObjectURL(b);
+    $('shotBadge').textContent = new Date().toLocaleTimeString();
+    $('shotBadge').className = 'badge ok';
+  } catch (e) {
+    $('shotBadge').textContent = '失败'; $('shotBadge').className = 'badge err';
+  }
+}
+
+async function sendCode() {
+  if (!KEY) return setMsg('phMsg', '先设置 Key', 'warn');
+  const phone = $('phone').value.trim(), area = $('area').value;
+  if (!phone) return setMsg('phMsg', '填手机号', 'warn');
+  $('sendBtn').disabled = true;
+  setMsg('phMsg', '发送中...');
+  try {
+    const r = await fetch('/login/phone/send', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ phone, area }) });
+    const d = await r.json();
+    const res = d.result || {};
+    if (res.toast) setMsg('phMsg', '页面返回：' + res.toast, res.toast.toLowerCase().includes('valid') ? 'err' : 'ok');
+    else if (res.err) setMsg('phMsg', res.err, 'err');
+    else setMsg('phMsg', '已触发发送（区号 ' + (res.area || area) + '），收到验证码后填入并提交', 'ok');
+    loadShot();
+  } catch (e) { setMsg('phMsg', String(e), 'err'); }
+  finally { $('sendBtn').disabled = false; }
+}
+
+async function verifyCode() {
+  if (!KEY) return setMsg('phMsg', '先设置 Key', 'warn');
+  const code = $('code').value.trim();
+  if (!code) return setMsg('phMsg', '填验证码', 'warn');
+  setMsg('phMsg', '提交中...');
+  try {
+    const r = await fetch('/login/phone/verify', { method: 'POST', headers: authHeaders(), body: JSON.stringify({ code }) });
+    const d = await r.json();
+    const res = d.result || {};
+    if (res.logged_in) { setMsg('phMsg', '登录成功 ✓ 登录态已持久化', 'ok'); $('phBadge').textContent = '已登录'; $('phBadge').className = 'badge ok'; }
+    else setMsg('phMsg', '未登录成功' + (res.toast ? '：' + res.toast : ''), 'err');
+    loadShot();
+  } catch (e) { setMsg('phMsg', String(e), 'err'); }
+}
+
+(async function init() {
+  try { const i = await (await fetch('/admin/whoami')).json(); $('whoami').textContent = i.name + ' · ' + i.base_url; } catch (e) {}
+  if (KEY) { probe(); loadShot(); } else { $('keyBadge').textContent = '未设置'; }
+})();
+</script>
+</body>
+</html>
+"""
+
+
+POOL_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>元宝号池总览</title>
+<style>
+  :root { --bg:#faf9f7; --card:#fff; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; --ok:#3B6D11; --err:#A32D2D; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:18px; font-weight:500; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
+  .card h2 { font-size:14px; font-weight:500; margin:0 0 8px; display:flex; justify-content:space-between; align-items:center; }
+  .badge { font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .badge.ok { color:var(--ok); border-color:var(--ok); }
+  .badge.err { color:var(--err); border-color:var(--err); }
+  .muted { color:var(--muted); font-size:12px; }
+  input { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:13px inherit; margin-top:8px; }
+  a { color:var(--accent); }
+  img { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:10px; }
+  button { margin-top:10px; padding:7px 12px; border:1px solid var(--accent); background:#fff; color:var(--accent); border-radius:8px; cursor:pointer; font:13px inherit; }
+</style>
+</head>
+<body>
+<h1>元宝号池总览</h1>
+<div class="sub">实例列表来自服务端 YB_POOL_PEERS 配置 · 状态实时探测</div>
+<label class="muted">门禁 Key（本地保存）</label>
+<input id="key" type="password" placeholder="sk-yuanbao-...">
+<div class="grid" id="pool" style="margin-top:16px"></div>
+<script>
+const $ = (id) => document.getElementById(id);
+let KEY = localStorage.getItem('yb_key') || '';
+$('key').value = KEY;
+$('key').onchange = () => { KEY = $('key').value.trim(); localStorage.setItem('yb_key', KEY); render(); };
+
+async function peers() { const r = await fetch('/admin/peers'); return (await r.json()).peers || []; }
+
+async function render() {
+  const list = await peers();
+  $('pool').innerHTML = '';
+  if (!list.length) { $('pool').innerHTML = '<div class="card muted">未配置实例（YB_POOL_PEERS 为空）</div>'; return; }
+  for (const p of list) {
+    const el = document.createElement('div');
+    el.className = 'card';
+    el.innerHTML = '<h2>' + p.name + ' <span class="badge" id="b_' + p.id + '">检测中</span></h2>'
+      + '<div class="muted" id="m_' + p.id + '">' + p.url + '</div>';
+    $('pool').appendChild(el);
+    probePeer(p);
+  }
+}
+
+async function probePeer(p) {
+  const badge = $('b_' + p.id), info = $('m_' + p.id);
+  try {
+    const t0 = Date.now();
+    const r = await fetch(p.url + '/v1/models', { headers: { 'Authorization': 'Bearer ' + KEY } });
+    const ms = Date.now() - t0;
+    if (r.status === 401) { badge.textContent = 'Key 无效'; badge.className = 'badge err'; return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    badge.textContent = '在线 ' + ms + 'ms'; badge.className = 'badge ok';
+    info.innerHTML = p.url + ' · <a href="' + p.url + '/admin" target="_blank">管理页</a>';
+    try {
+      const sr = await fetch(p.url + '/login', { headers: { 'Authorization': 'Bearer ' + KEY } });
+      if (sr.ok) {
+        const shot = document.createElement('img');
+        shot.src = URL.createObjectURL(await sr.blob());
+        badge.closest('.card').appendChild(shot);
+      }
+    } catch (e) {}
+  } catch (e) {
+    badge.textContent = '异常'; badge.className = 'badge err';
+    info.textContent = p.url + ' · ' + String(e);
+  }
+}
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def _pool_peers():
+    """YB_POOL_PEERS: JSON 数组 [{"name","url"}] 或 "name=url,name2=url2" 形式。"""
+    raw = os.environ.get("YB_POOL_PEERS", "").strip()
+    peers = []
+    if not raw:
+        return peers
+    if raw.startswith("["):
+        try:
+            peers = json.loads(raw)
+        except Exception:
+            peers = []
+    else:
+        for i, item in enumerate(raw.split(",")):
+            item = item.strip()
+            if not item:
+                continue
+            if "=" in item:
+                name, url = item.split("=", 1)
+            else:
+                name, url = f"acc{i+1}", item
+            peers.append({"name": name.strip(), "url": url.strip().rstrip("/")})
+    for i, x in enumerate(peers):
+        x["id"] = f"p{i}"
+        x.setdefault("name", f"acc{i+1}")
+    return peers
+
+
+@app.get("/admin", response_class=Response)
+async def admin_page(req: Request):
+    # 页面壳免鉴权（无 Key 者需打开页面输入 Key）；所有数据端点仍校门禁
+    return Response(content=ADMIN_HTML, media_type="text/html; charset=utf-8")
+
+
+@app.get("/pool", response_class=Response)
+async def pool_page(req: Request):
+    return Response(content=POOL_HTML, media_type="text/html; charset=utf-8")
+
+
+@app.get("/admin/whoami")
+async def admin_whoami(req: Request):
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    return {"name": os.environ.get("YB_INSTANCE_NAME", "yuanbao-proxy"),
+            "base_url": os.environ.get("YB_BASE_URL", ""),
+            "mint_backend": YB_MINT_BACKEND, "data_plane": YB_DATA_PLANE}
+
+
+@app.get("/admin/peers")
+async def admin_peers(req: Request):
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    return {"peers": _pool_peers()}
+
+
 @app.get("/v1/models")
 async def list_models(req: Request):
     cred = _check_auth(req)

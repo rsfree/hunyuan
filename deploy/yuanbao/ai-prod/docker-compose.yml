@@ -15,3 +15,6 @@ services:
       YB_DATA_PLANE: "cookie"
       CDP_HTTP: "http://127.0.0.1:9222"   # 同容器 loopback（多 worker 共享）
       YB_WORKERS: "4"
+      YB_INSTANCE_NAME: "yuanbao-acc01"
+      YB_BASE_URL: "https://yuanbao.1task.cn"
+      YB_POOL_PEERS: "acc01=https://yuanbao.1task.cn"   # 号池总览数据源（加账号时在此追加 name=url）

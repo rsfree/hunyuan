@@ -54,7 +54,61 @@ YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
 YB_MINT_BACKEND = os.environ.get("YB_MINT_BACKEND", "cdp")  # cdp（默认，headless Chrome 铸签，无 bsk）| bsk（遗留）| http（远程 minter）
 YB_COOKIE_FILE = os.environ.get("YB_COOKIE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.txt"))  # 默认凭证文件（无 bsk 数据面）
-YB_PROXY_URL = os.environ.get("YB_PROXY_URL", "")    # 出站代理（住宅代理优先）：http://host:port 或 socks5://host:port
+YB_PROXY_URL = os.environ.get("YB_PROXY_URL", "")    # 单条代理（兼容）：http://host:port
+YB_PROXY_POOL = os.environ.get("YB_PROXY_POOL", "")   # 代理池（逗号分隔）：url1,url2,... 数据面逐请求轮换
+_PROXY_BAD: dict = {}          # 代理 -> 冷却截止（失败后 60s 内跳过）
+_PROXY_IDX = 0
+
+
+def _proxy_list():
+    pool = [x.strip() for x in YB_PROXY_POOL.split(",") if x.strip()]
+    if not pool and YB_PROXY_URL:
+        pool = [YB_PROXY_URL.strip()]
+    return pool
+
+
+def _proxy_next():
+    """池内轮换：跳过冷却中的；全冷却时返回 None（直连兜底）。"""
+    global _PROXY_IDX
+    pool = _proxy_list()
+    if not pool:
+        return None
+    now = time.time()
+    healthy = [x for x in pool if _PROXY_BAD.get(x, 0) <= now]
+    if not healthy:
+        return None
+    pr = healthy[_PROXY_IDX % len(healthy)]
+    _PROXY_IDX += 1
+    return pr
+
+
+def _proxy_mark_bad(url: str, seconds: float = 60):
+    _PROXY_BAD[url] = time.time() + seconds
+
+
+def _open(req, timeout: int = 300):
+    """带池轮换的出站请求。
+    仅"连不上"类错误才标记代理故障并换下一个/直连兜底；HTTP 4xx/5xx 属正常响应（代理是通的），直接返回。"""
+    order = []
+    pool = _proxy_list()
+    n = len(pool) or 1
+    for _ in range(n + 1):          # 池内每个代理各试一次 + 直连兜底
+        pr = _proxy_next()
+        handler = _ureq.ProxyHandler({"http": pr, "https": pr}) if pr else _ureq.ProxyHandler({})
+        order.append(pr or "(直连)")
+        # 每次尝试用全新 Request（同一对象在失败后复用会带着旧连接状态）
+        fresh = _ureq.Request(req.full_url, data=getattr(req, "data", None),
+                              headers=dict(req.headers), method=req.get_method())
+        try:
+            return _ureq.build_opener(handler).open(fresh, timeout=timeout)
+        except _uerr.HTTPError:
+            raise                    # 有 HTTP 响应 = 链路通，交给上层按状态码处理
+        except Exception:
+            if pr:
+                _proxy_mark_bad(pr, 60)
+                continue
+            raise
+    raise RuntimeError("代理池全部不可用且直连失败: " + " → ".join(order))
 YB_DATA_PLANE = os.environ.get("YB_DATA_PLANE", "auto")  # auto|page|cookie：auto=cdp 走页内、bsk 走页内+文件兜底
 YB_MINTER_URL = os.environ.get("YB_MINTER_URL", "")   # 远程 minter 服务（YB_MINT_BACKEND=http 时用）
 YB_MINTER_TOKEN = os.environ.get("YB_MINTER_TOKEN", "")  # minter 服务鉴权（X-Minter-Key）
@@ -183,7 +237,7 @@ def _yb_post_json(cookie: str, path: str, body: dict, sig: Optional[dict], agent
                         data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
                         headers=h, method="POST")
     try:
-        with _OPENER.open(req, timeout=timeout) as r:
+        with _open(req, timeout=timeout) as r:
             return {"status": r.status, "text": r.read().decode("utf-8", "replace")}
     except _uerr.HTTPError as e:
         return {"status": e.code, "text": e.read().decode("utf-8", "replace")}
@@ -1655,6 +1709,36 @@ async def admin_whoami(req: Request):
     return {"name": os.environ.get("YB_INSTANCE_NAME", "yuanbao-proxy"),
             "base_url": os.environ.get("YB_BASE_URL", ""),
             "mint_backend": YB_MINT_BACKEND, "data_plane": YB_DATA_PLANE}
+
+
+@app.get("/admin/proxy")
+async def admin_proxy(req: Request):
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    now = time.time()
+    return {"pool": [{"url": p, "cooldown_left": round(max(0, _PROXY_BAD.get(p, 0) - now), 1)} for p in _proxy_list()],
+            "browser_proxy": os.environ.get("YB_PROXY_URL") or "(未启用)"}
+
+
+@app.post("/admin/proxy/rotate")
+async def admin_proxy_rotate(req: Request):
+    """换浏览器出口 IP：从池里取下一个代理，重启 chromium 并重新预热页面。"""
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    pr = _proxy_next()
+    if not pr:
+        return JSONResponse({"error": "代理池为空（YB_PROXY_POOL/YB_PROXY_URL 未配置）"}, status_code=400)
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    try:
+        ok = await asyncio.to_thread(m.restart_with_proxy, pr)
+        return {"rotated_to": pr, "ok": ok}
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
 
 
 @app.get("/admin/peers")

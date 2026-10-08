@@ -201,3 +201,17 @@ hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-
   裸 API 带该字段**不会**被隐藏（实测对照：UI 临时会话 detail 存 isTemporary=true 且不在列表，
   API 同字段会话在列表无标记）⇒ 代理改用「用完即删」保证历史干净
 - 彩蛋：`/api/image/removewatermark` 接口存在（yb-util chunk），待逆向
+
+## 12. 去水印端点逆向现状（实验性）
+
+- 端点：`POST /api/image/removewatermark`，SSE 响应；空参 → "输入图片为空"/"images url is nil"
+- 同族接口：`/api/image/clarity`（高清）、`/api/image/style`、`/api/image/outpainting`（扩图）、
+  `/api/image/elimination`（消除）——均挂在图像编辑器（非会员功能）
+- 已穷举参数形态（JSON `images`×6 种、包装 2 种、multipart×3）→ 全部"images url is nil"
+  服务端真实契约在图像编辑器 chunk（按需加载），需从编辑器 UI 真实触发一次才能拿到
+- 代理已留管道：model=`hy-image-unwatermark`（chat 门 + image_url 输入）→ 自动走多形态尝试，
+  未破解时返回 501 + removewatermark_experimental；参数破解后即插即用
+- 注意：**元宝自产图本就无水印**（originUrl/_h0_ + 账号「无水印保存」开关），此端点只对
+  外部/水印图有价值
+- 踩坑：往 Python `"""` JS 模板里写 `\n` 会被解成真实换行 → JS 字符串断裂 SyntaxError；
+  必须写 `\\n`。大图 data URI 走 argv 会 E2BIG → 分块暂存 window.__payload 再执行

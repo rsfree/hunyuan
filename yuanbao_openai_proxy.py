@@ -96,8 +96,11 @@ IMAGE_MODEL_PREFIXES = ("hy-image", "dall-e")
 
 
 def _is_image_model(name: str) -> bool:
-    """hy-image-* / dall-e-* 系列一律视为生图模型（hy-image-* 通配别名）。"""
+    """hy-image-* / dall-e-* 系列一律视为生图模型（hy-image-* 通配别名）。
+    排除去水印专用名（hy-image-unwatermark / removewatermark）。"""
     n = (name or "").lower()
+    if n in ("hy-image-unwatermark", "removewatermark"):
+        return False
     return n.startswith(IMAGE_MODEL_PREFIXES)
 
 app = FastAPI(title="yuanbao-openai-proxy")
@@ -284,7 +287,13 @@ def _ev(expr: str, tab_id: Optional[str] = None, timeout: int = 180):
         raise RuntimeError(f"bsk evaluate 无输出: {out[:200]}")
     j = json.loads(out[i:])
     if not j.get("ok"):
-        raise RuntimeError(f"bsk evaluate 失败: {out[:200]}")
+        err = j.get("error") or {}
+        diag = ""
+        if "SyntaxError" in str(err.get("text", "")):
+            lines = expr.split("\n")
+            ln = err.get("line", 0)
+            diag = f" | expr_lines={len(lines)} expr_len={len(expr)} L{ln}={lines[ln-1][:80]!r}" if 0 < ln <= len(lines) else f" | expr_len={len(expr)}"
+        raise RuntimeError(f"bsk evaluate 失败: {out[:200]}{diag}")
     return j.get("value")
 
 
@@ -692,6 +701,40 @@ def _ref_to_data_uri(ref: str) -> str:
     return f"data:image/png;base64,{ref}"
 
 
+# ---------------- 去水印（实验性） ----------------
+JS_REMOVE_WATERMARK = """
+(async (p) => {
+  const dataUri = "data:image/png;base64," + window.__payload.b64;
+  const shapes = [
+    {images: [dataUri]},
+    {images: [{url: dataUri}]},
+  ];
+  for (const body of shapes) {
+    const r = await fetch("/api/image/removewatermark", {
+      method: "POST", headers: {"content-type": "application/json"}, body: JSON.stringify(body)
+    });
+    const t = await r.text();
+    if (!t.includes("url is nil") && !t.includes("输入图片为空")) {
+      // 解析 SSE 里的图片结果
+      const urls = [];
+      for (const line of t.split("\\n")) {
+        if (!line.startsWith("data: ")) continue;
+        try {
+          const o = JSON.parse(line.slice(6).trim());
+          if (o.url) urls.push(o.url);
+          if (o.replace && o.replace.multimedias) {
+            urls.push(...o.replace.multimedias.map(m => m.originUrl || m.url).filter(Boolean));
+          }
+        } catch (e) {}
+      }
+      if (urls.length) return {ok: true, urls};
+      return {ok: false, status: r.status, body: t.slice(0, 200)};
+    }
+  }
+  return {ok: false, reason: "param_shape_unknown", dataUriLen: dataUri.length, head: dataUri.slice(0, 40), tail: dataUri.slice(-20)};
+})
+"""
+
 # ---------------- 页内 JS：i2i 上传 + 图生图 ----------------
 JS_UPLOAD_REF = """
 (async (p) => {
@@ -1011,7 +1054,8 @@ def _flatten_messages(messages: list) -> str:
 async def list_models():
     now = int(time.time())
     ids = ["hunyuan", "hunyuan-t1", "deepseek-v3", "deepseek-r1",
-           "hy-image", "hy-image-3.5", "hy-image-v3.5", "hy-image-v3.5-preview", "dall-e-3"]
+           "hy-image", "hy-image-3.5", "hy-image-v3.5", "hy-image-v3.5-preview", "dall-e-3",
+           "hy-image-unwatermark"]
     return {"object": "list", "data": [{"id": i, "object": "model", "created": now, "owned_by": "tencent-yuanbao"} for i in ids]}
 
 
@@ -1038,11 +1082,14 @@ async def chat_completions(req: Request):
         prompt = _flatten_messages(messages)
     if not prompt and not image_refs:
         return JSONResponse({"error": {"message": "messages 为空", "type": "invalid_request_error"}}, status_code=400)
+    unwm = model_in.lower() in ("hy-image-unwatermark", "removewatermark")
+    if unwm and not image_refs:
+        return JSONResponse({"error": {"message": "去水印需要提供图片：messages 里带 image_url", "type": "invalid_request_error"}}, status_code=400)
 
     created = int(time.time())
     comp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     # hy-image-* / dall-e-* 生图模型：chat 门直接走生图管道（无图 t2i，带图 i2i）
-    image_flow = bool(image_refs) or _is_image_model(model_in)
+    image_flow = bool(image_refs) or (_is_image_model(model_in) and not unwm)
 
     conv_created = None  # 本次新建的会话（用完即删）
     try:
@@ -1064,7 +1111,7 @@ async def chat_completions(req: Request):
                     conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
                     conv_created = conv
                 sig = get_sig(tab)
-                if image_refs:
+                if image_refs and not unwm:
                     # ---- 图生图前门：上传参考图 → msgScene 12 生图 ----
                     import base64 as _b64
                     multimedia = []
@@ -1084,6 +1131,33 @@ async def chat_completions(req: Request):
                         f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
+                elif unwm:
+                    # ---- 去水印：转 data URI → 分块暂存 → /api/image/removewatermark ----
+                    import base64 as _b64
+                    data_uri = _ref_to_data_uri(image_refs[0])
+                    head, _, b64data = data_uri.partition(";base64,")
+                    mime = head[5:].split(";")[0] or "image/png"
+                    if not mime.startswith("image/"):
+                        mime = "image/png"
+                    _ev("window.__payload = {}; 'ok'", tab_id=tab)
+                    CHUNK = 100_000
+                    n_chunks = (len(b64data) + CHUNK - 1) // CHUNK
+                    print(f"[unwm] b64 {len(b64data)//1024}KB -> {n_chunks} chunks", flush=True)
+                    for i in range(0, len(b64data), CHUNK):
+                        part = b64data[i:i+CHUNK]
+                        try:
+                            _ev(f"window.__payload.b64 = (window.__payload.b64||'') + {json.dumps(part)}", tab_id=tab, timeout=60)
+                            print(f"[unwm] chunk {i//CHUNK + 1}/{n_chunks} ok", flush=True)
+                        except Exception as ce:
+                            print(f"[unwm] chunk {i//CHUNK + 1}/{n_chunks} FAILED: {str(ce)[:150]}", flush=True)
+                            raise
+                    result = _ev(f"({JS_REMOVE_WATERMARK})({json.dumps({})})", tab_id=tab, timeout=180)
+                    print(f"[unwm] removewatermark done: ok={result.get('ok')}", flush=True)
+                    if result.get("ok") and result.get("urls"):
+                        result = {"status": 200, "urls": result["urls"], "wmUrls": result["urls"], "error": None, "raw": None}
+                    else:
+                        reason = json.dumps(result, ensure_ascii=False)[:250]
+                        return JSONResponse({"error": {"message": f"去水印（实验性）失败：{reason}", "type": "api_error", "code": "removewatermark_failed"}}, status_code=502)
                 elif image_flow:
                     # ---- chat 门生图模型（hy-image-* 等）：文生图 ----
                     result = _ev(
@@ -1099,6 +1173,8 @@ async def chat_completions(req: Request):
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
 
     # 用完即删（浏览器模式）：历史零残留
@@ -1109,7 +1185,7 @@ async def chat_completions(req: Request):
             pass
 
     # ---- 图生图：data[] 包回 choices[0].message.content parts ----
-    if image_flow:
+    if image_flow or unwm:
         auth_err = _yb_auth_error(result)
         if auth_err:
             return auth_err
@@ -1275,7 +1351,7 @@ async def images_generations(req: Request):
                     conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
                     conv_created = conv
                 sig = get_sig(tab)
-                if image_refs:
+                if image_refs and not unwm:
                     # ---- 图生图（image 字段）----
                     import base64 as _b64
                     multimedia = []

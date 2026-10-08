@@ -49,7 +49,7 @@ YUANBAO_CONVERSATION = os.environ.get("YUANBAO_CONVERSATION", "")  # 固定会�
 YUANBAO_API_KEY = os.environ.get("YUANBAO_API_KEY", "")  # 门禁 key；空=不校验（客户端 Bearer 随意）
 YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(不进历史，反风控)；0=普通
 YB_DELETE_CONV = os.environ.get("YB_DELETE_CONV", "1")    # 1=生成完自动删除本次创建的会话（历史零残留）
-YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")    # 1=默认走官方 create 建会话（与前端行为一致，反风控优先）；0=客户端 UUID 捷径（少一次请求，但属非官方行为模式）
+YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
 YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
 YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙")自动退避重试次数
@@ -1105,6 +1105,7 @@ async def chat_completions(req: Request):
                                       _size_to_resolution(body.get("size", "")),
                                       _size_to_ratio(body.get("size", "")),
                                       force_image=_is_image_model(model_in))
+
         else:
             ctx = _ensure_page()
             tab = ctx["tabId"]
@@ -1349,6 +1350,7 @@ async def images_generations(req: Request):
             result = _cookie_mode_run(cookie_str, _ensure_page()["agentId"], prompt,
                                       chat_model, image_refs, resolution,
                                       _size_to_ratio(body.get("size", "")))
+
         else:
             ctx = _ensure_page()
             tab = ctx["tabId"]

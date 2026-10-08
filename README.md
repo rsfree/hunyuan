@@ -35,6 +35,9 @@ python3 yuanbao_openai_proxy.py        # 127.0.0.1:8177
 依赖：本机 bsk CLI + 浏览器扩展在线 + 已登录元宝的 Chrome。签名三件套
 （X-Uskey/X-Bus-Params-Md5/X-Timestamp）由页面 Qimei SDK 现场铸造，无法离线复现。
 
+**多账号轮换不在本服务做**——交给上层网关（new-api）：每个元宝账号建一个渠道、
+各指向一个代理实例（不同端口/机器，`X-Yuanbao-Cookie` 各配各的），网关负责权重与故障转移。
+
 ## 工具
 
 | 文件 | 用途 |

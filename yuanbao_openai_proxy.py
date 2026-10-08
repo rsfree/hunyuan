@@ -48,6 +48,7 @@ YUANBAO_AGENT_ID = os.environ.get("YUANBAO_AGENT_ID", "auto")  # naQivTmsDa
 YUANBAO_CONVERSATION = os.environ.get("YUANBAO_CONVERSATION", "")  # 固定会话；空=每请求新建
 YUANBAO_API_KEY = os.environ.get("YUANBAO_API_KEY", "")  # 门禁 key；空=不校验（客户端 Bearer 随意）
 YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(不进历史，反风控)；0=普通
+YB_DELETE_CONV = os.environ.get("YB_DELETE_CONV", "1")    # 1=生成完自动删除本次创建的会话（历史零残留）
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
 YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
 YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙")自动退避重试次数
@@ -589,6 +590,16 @@ JS_IMAGE = """
 })
 """
 
+JS_DELETE_CONV = """
+(async (p) => {
+  const r = await fetch('/api/user/agent/conversation/v1/delete', {
+    method: 'POST', headers: {'content-type': 'application/json'},
+    body: JSON.stringify({cid: p.conv})
+  });
+  return {status: r.status};
+})
+"""
+
 JS_INJECT_STATIC = (
     "window.__ybStaticHeaders = " + json.dumps(STATIC_HEADERS) + "; 'ok'"
 )
@@ -856,6 +867,7 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
     ctx = _ensure_page()
     pace("ck:" + cookie[:16])
     with _bsk_lock:
+        created_convs = []  # 本次运行创建的会话（结束后统一删除）
         def run_once(sig):
             if YUANBAO_CONVERSATION:
                 conv = YUANBAO_CONVERSATION
@@ -867,6 +879,7 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
                 conv = json.loads(r["text"]).get("id")
                 if not conv:
                     raise RuntimeError("创建会话失败: " + r["text"][:150])
+                created_convs.append(conv)
             if image_refs or force_image:
                 multimedia = []
                 for i, ref in enumerate(image_refs[:4]):
@@ -897,6 +910,14 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
             time.sleep(2.0 * attempt)
             sig = get_sig(ctx["tabId"], force=True)
             result = run_once(sig)
+        # 用完即删：本次创建的会话全部清理（含软拒重试产生的），历史零残留
+        if YB_DELETE_CONV == "1":
+            for cv in created_convs:
+                try:
+                    _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
+                                  {"cid": cv}, sig, agent_id, timeout=30)
+                except Exception:
+                    pass
         return result
 
 
@@ -1023,6 +1044,7 @@ async def chat_completions(req: Request):
     # hy-image-* / dall-e-* 生图模型：chat 门直接走生图管道（无图 t2i，带图 i2i）
     image_flow = bool(image_refs) or _is_image_model(model_in)
 
+    conv_created = None  # 本次新建的会话（用完即删）
     try:
         if cookie_str:
             # ---- 凭证透传模式：客户端 cookie + 页内铸签名，数据面走出站 HTTP ----
@@ -1040,6 +1062,7 @@ async def chat_completions(req: Request):
                     conv = YUANBAO_CONVERSATION
                 else:
                     conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    conv_created = conv
                 sig = get_sig(tab)
                 if image_refs:
                     # ---- 图生图前门：上传参考图 → msgScene 12 生图 ----
@@ -1058,25 +1081,32 @@ async def chat_completions(req: Request):
                         )
                         multimedia.append(entry)
                     result = _ev(
-                        f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'sig': sig})})",
+                        f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
                 elif image_flow:
                     # ---- chat 门生图模型（hy-image-* 等）：文生图 ----
                     result = _ev(
-                        f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'sig': sig})})",
+                        f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
                 else:
                     # ---- 纯文本聊天 ----
                     result = _ev(
-                        f"({JS_CHAT})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'chatModelId': chat_model, 'sig': sig})})",
+                        f"({JS_CHAT})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
     except Exception as e:
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
+
+    # 用完即删（浏览器模式）：历史零残留
+    if conv_created:
+        try:
+            _ev(f"({JS_DELETE_CONV})({json.dumps({'conv': conv_created})})", tab_id=tab, timeout=30)
+        except Exception:
+            pass
 
     # ---- 图生图：data[] 包回 choices[0].message.content parts ----
     if image_flow:
@@ -1228,6 +1258,7 @@ async def images_generations(req: Request):
     resolution = _size_to_resolution(body.get("size", ""))
 
     created = int(time.time())
+    conv_created = None
     try:
         if cookie_str:
             result = _cookie_mode_run(cookie_str, _ensure_page()["agentId"], prompt,
@@ -1242,7 +1273,8 @@ async def images_generations(req: Request):
                     conv = YUANBAO_CONVERSATION
                 else:
                     conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
-                sig = _mint_and_inject(tab)
+                    conv_created = conv
+                sig = get_sig(tab)
                 if image_refs:
                     # ---- 图生图（image 字段）----
                     import base64 as _b64
@@ -1260,16 +1292,23 @@ async def images_generations(req: Request):
                         )
                         multimedia.append(entry)
                     result = _ev(
-                        f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': resolution, 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'sig': sig})})",
+                        f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': resolution, 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
                 else:
                     result = _ev(
-                        f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': resolution, 'ratio': _size_to_ratio(body.get('size', '')), 'sig': sig})})",
+                        f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': resolution, 'ratio': _size_to_ratio(body.get('size', '')), 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
     except Exception as e:
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
+
+    # 用完即删（浏览器模式）：历史零残留
+    if conv_created:
+        try:
+            _ev(f"({JS_DELETE_CONV})({json.dumps({'conv': conv_created})})", tab_id=tab, timeout=30)
+        except Exception:
+            pass
 
     auth_err = _yb_auth_error(result)
     if auth_err:

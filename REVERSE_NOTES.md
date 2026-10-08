@@ -192,3 +192,12 @@ chat、genUploadInfo+COS PUT 全出站）；签名三件套仍借页面铸造（
 
 hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-image-v3.5 / hy-image-v3.5-preview`，
 无参考图=文生图（msgScene 13），带 image_url=图生图（msgScene 12），返回 content parts 图组。
+
+## 11. 用完即删（历史零残留）
+
+- 删除端点：`POST /api/user/agent/conversation/v1/delete`，body `{"cid": "<conversationId>"}`（无签名也放行）
+- 代理默认 `YB_DELETE_CONV=1`：本次新建的会话（含软拒重试产生的中间会话）在响应前 best-effort 全部删除
+- 临时会话真相：`isTemporary: true` 只在「UI 临时模式」下由服务端存储并在列表隐藏；
+  裸 API 带该字段**不会**被隐藏（实测对照：UI 临时会话 detail 存 isTemporary=true 且不在列表，
+  API 同字段会话在列表无标记）⇒ 代理改用「用完即删」保证历史干净
+- 彩蛋：`/api/image/removewatermark` 接口存在（yb-util chunk），待逆向

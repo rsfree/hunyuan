@@ -33,6 +33,8 @@ services:
       YB_AUTO_REENABLE_AFTER: "${YB_AUTO_REENABLE_AFTER:-3}"
       YB_AUTO_EJECT_AFTER_DAYS: "${YB_AUTO_EJECT_AFTER_DAYS:-0}"
       YB_ROUTER: "${YB_ROUTER:-1}"
+      # 构建版本（update-service.sh 注入 git describe），可用 /admin/version 核对线上版本
+      YB_BUILD_VERSION: "${YB_BUILD_VERSION:-unknown}"
       YB_MINT_BACKEND: "cdp"
       YB_DATA_PLANE: "${YB_DATA_PLANE:-page}"   # page=用容器自带登录态（扫码登录后免 cookie）；cookie=出站HTTP+文件cookie
       CDP_HTTP: "http://127.0.0.1:9222"   # 同容器 loopback

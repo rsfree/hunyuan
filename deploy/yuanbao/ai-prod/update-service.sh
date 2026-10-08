@@ -73,6 +73,16 @@ update_one() {
   log "=== 更新 $acc（容器 yuanbao-$name, 端口 $port）==="
   backup_one "$acc" || return 1
 
+  # 注入构建版本（git describe 优先，退回短 SHA），便于部署后 /admin/version 核对
+  local build_ver
+  if [ -n "${YB_BUILD_VERSION:-}" ]; then
+    build_ver="$YB_BUILD_VERSION"          # 显式传入优先（部署目录通常不是 git 仓库）
+  else
+    build_ver="$(git -C "$ROOT" describe --tags --always --dirty 2>/dev/null || echo unknown)"
+  fi
+  export YB_BUILD_VERSION="$build_ver"
+  log "构建版本：$build_ver"
+
   log "构建镜像 ..."
   # shellcheck disable=SC2086
   docker compose $args build || { err "构建失败"; return 1; }
@@ -105,6 +115,7 @@ update_one() {
   fi
   ka=$(curl -s -m 120 -X POST -H "Authorization: Bearer $key" "http://127.0.0.1:$port/admin/keepalive" || true)
   log "保活: $ka"
+  log "线上版本: $(curl -s -m 15 "http://127.0.0.1:$port/admin/version" || echo '(取不到)')"
   printf '%s' "$ka" | grep -q '"ok":true' || err "⚠️ 保活未通过（cookie 可能已失效）"
   log "=== $acc 更新完成 ==="
 }

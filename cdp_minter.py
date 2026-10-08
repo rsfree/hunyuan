@@ -29,6 +29,7 @@ if not CHROME_BIN:
             CHROME_BIN = _c
             break
 CDP_YB_URL = os.environ.get("CDP_YB_URL", "https://yuanbao.tencent.com/chat/naQivTmsDa")
+CHROME_PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR", "/data/chrome-profile")  # 与 entrypoint 保持一致（登录态所在）
 # 设备指纹种子：注入已知账号绑定的设备身份（避免 headless 新指纹触发风控）
 # 格式 "k1=v1;k2=v2"（localStorage 键值对）
 DEVICE_SEED = os.environ.get("YB_DEVICE_SEED", "_qimei_h38=e9632faf082420cd40bb971703000001419610")
@@ -150,11 +151,53 @@ class CDPMinter:
             return
         if not CHROME_BIN:
             return  # 假定外部已提供 CDP 端点
-        self._chrome_proc = subprocess.Popen(
-            [CHROME_BIN, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
-             "--disable-gpu", "--remote-debugging-port=" + CDP_HTTP.split(":")[-1],
-             "--user-data-dir=/tmp/yb-chrome", "about:blank"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proxy = getattr(self, "_proxy_override", None) or os.environ.get("YB_PROXY_URL") or ""
+        args = [CHROME_BIN, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage",
+                "--disable-gpu", "--ignore-certificate-errors",
+                "--disable-blink-features=AutomationControlled", "--lang=zh-CN",
+                "--remote-debugging-port=" + CDP_HTTP.split(":")[-1],
+                "--user-data-dir=" + CHROME_PROFILE_DIR]
+        if proxy:
+            args.append("--proxy-server=" + proxy)
+        args.append("about:blank")
+        self._chrome_proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def restart_with_proxy(self, proxy_url: str) -> bool:
+        """换浏览器出口 IP：杀掉现 chromium（含 entrypoint 拉起的），以新代理重启并重新预热。"""
+        with self._lock:
+            self._proxy_override = proxy_url
+            for ws_attr in ("_page_ws", "_browser_ws"):
+                ws = getattr(self, ws_attr)
+                if ws:
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    setattr(self, ws_attr, None)
+            if self._chrome_proc:
+                try:
+                    self._chrome_proc.terminate()
+                    self._chrome_proc.wait(timeout=10)
+                except Exception:
+                    pass
+                self._chrome_proc = None
+            # entrypoint 拉起的 chromium 没有本地句柄：按路径匹配清理
+            try:
+                subprocess.run(["pkill", "-f", "chrome-linux/chrome"], timeout=10)
+            except Exception:
+                pass
+            time.sleep(2)
+            # 清陈旧 profile 锁（hostname 变化后 Chromium 会拒启）
+            for lk in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+                try:
+                    os.remove(os.path.join(CHROME_PROFILE_DIR, lk))
+                except Exception:
+                    pass
+            try:
+                self._ensure_page()
+                return bool(self._warm)
+            except Exception:
+                return False
 
     def _ws_send(self, ws, method, params=None, mid=1):
         ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))

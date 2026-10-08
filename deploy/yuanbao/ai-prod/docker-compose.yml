@@ -18,4 +18,5 @@ services:
       YB_INSTANCE_NAME: "yuanbao-acc01"
       YB_BASE_URL: "https://yuanbao.1task.cn"
       YB_POOL_PEERS: "acc01=https://yuanbao.1task.cn"   # 号池总览数据源（加账号时在此追加 name=url）
-      # YB_PROXY_URL: "http://user:pass@住宅代理:端口"    # 可选：chromium+出站同走代理（降低 AQ 风控；socks5 需另行加 PySocks）
+      # YB_PROXY_URL: "http://user:pass@代理1:端口"       # 单条代理（浏览器启动用）
+      # YB_PROXY_POOL: "http://u:p@代理1:端口,http://u:p@代理2:端口"   # 代理池：数据面逐请求轮换；/admin/proxy 查状态，/admin/proxy/rotate 换浏览器 IP

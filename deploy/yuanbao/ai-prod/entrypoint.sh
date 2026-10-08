@@ -1,5 +1,8 @@
 #!/bin/bash
 # 同容器：chromium（常驻预热，供签名铸造）+ 代理（可多 worker，共享同一 chromium）
+# 清陈旧 profile 锁：容器重建后 hostname 变化，Chromium 会误判"profile 被另一台电脑占用"而拒绝启动
+rm -f /data/chrome-profile/SingletonLock /data/chrome-profile/SingletonSocket /data/chrome-profile/SingletonCookie
+
 PROXY_ARGS=""
 [ -n "${YB_PROXY_URL:-}" ] && PROXY_ARGS="--proxy-server=${YB_PROXY_URL}"
 /ms-playwright/chromium-1148/chrome-linux/chrome \

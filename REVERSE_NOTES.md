@@ -215,3 +215,19 @@ hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-
   外部/水印图有价值
 - 踩坑：往 Python `"""` JS 模板里写 `\n` 会被解成真实换行 → JS 字符串断裂 SyntaxError；
   必须写 `\\n`。大图 data URI 走 argv 会 E2BIG → 分块暂存 window.__payload 再执行
+
+## 13. 无浏览器化调研结论（uskey 离线铸造可行性）
+
+- **实验矩阵**：create 不校验 uskey（无/空/垃圾全过）；**chat 强校验**（无 uskey →
+  假拒绝"抱歉，我无法回答这个问题"——风控软拒第二形态，与"服务繁忙"不同）
+- **SDK 定位**：QimeiWeb 类在独立 vendor chunk `yb_v2_vendor_qimei.*.js`（208KB，
+  模块 72101，零 webpack 依赖、自包含）；应用侧 12601 是薄封装（构造参数
+  `{appKey, disableDebugger, disableConsoleDetection}`）
+- **阻塞点**：模块 72101 是**字节码 VM 混淆**——switch 虚拟机解释器 + 编码操作数数组
+  （`Y[a[++F]][Y[a[++F]]].call(...)` 栈机），getUSKeySync 逻辑在字节码里。
+  离线复刻 = VM 逆向大工程，短期不可行
+- **已实现**：Node 离线 harness（qimei-node/mint_uskey.js）：假 webpack runtime +
+  浏览器 shims（CSS/navigator/document/localStorage/XHR）成功加载并实例化 SDK——
+  VM 逆向突破后即可接入；大 payload 分块暂存 window.__payload 绕 argv 限制
+- **部署结论**：当前最优 = 服务器 Docker 跑 headless Chrome（登录态 profile）+
+  bsk 等价物；或本机代理 + 服务器反代。签名每 60s 一次铸签调用的浏览器依赖已最小化

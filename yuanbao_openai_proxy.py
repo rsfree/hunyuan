@@ -86,20 +86,56 @@ def _proxy_mark_bad(url: str, seconds: float = 60):
     _PROXY_BAD[url] = time.time() + seconds
 
 
+class _RespShim:
+    """requests 响应 → urllib 风格垫片（status/read/headers/上下文管理）。"""
+
+    def __init__(self, resp):
+        self._r = resp
+        self.status = resp.status_code
+        self.headers = resp.headers
+
+    def read(self):
+        return self._r.content
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _open_socks(req, proxy_url: str, timeout: int):
+    """socks5/socks5h 出站（urllib 不支持 socks，走 requests+PySocks）。"""
+    import io
+    import requests
+    resp = requests.request(
+        req.get_method(), req.full_url, headers=dict(req.headers),
+        data=getattr(req, "data", None),
+        proxies={"http": proxy_url, "https": proxy_url},
+        timeout=timeout, verify=False,  # 上游证书链在部分链路不稳定（同 chromium -201）
+    )
+    if resp.status_code >= 400:
+        raise _uerr.HTTPError(req.full_url, resp.status_code, resp.reason, resp.headers, io.BytesIO(resp.content))
+    return _RespShim(resp)
+
+
 def _open(req, timeout: int = 300):
     """带池轮换的出站请求。
+    socks5h 走 requests；http/https 代理与直连走 urllib。
     仅"连不上"类错误才标记代理故障并换下一个/直连兜底；HTTP 4xx/5xx 属正常响应（代理是通的），直接返回。"""
     order = []
     pool = _proxy_list()
     n = len(pool) or 1
     for _ in range(n + 1):          # 池内每个代理各试一次 + 直连兜底
         pr = _proxy_next()
-        handler = _ureq.ProxyHandler({"http": pr, "https": pr}) if pr else _ureq.ProxyHandler({})
         order.append(pr or "(直连)")
         # 每次尝试用全新 Request（同一对象在失败后复用会带着旧连接状态）
         fresh = _ureq.Request(req.full_url, data=getattr(req, "data", None),
                               headers=dict(req.headers), method=req.get_method())
         try:
+            if pr and pr.split("://", 1)[0].lower().startswith("socks"):
+                return _open_socks(fresh, pr, timeout)
+            handler = _ureq.ProxyHandler({"http": pr, "https": pr}) if pr else _ureq.ProxyHandler({})
             return _ureq.build_opener(handler).open(fresh, timeout=timeout)
         except _uerr.HTTPError:
             raise                    # 有 HTTP 响应 = 链路通，交给上层按状态码处理

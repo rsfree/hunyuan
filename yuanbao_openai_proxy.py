@@ -54,6 +54,7 @@ YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
 YB_MINT_BACKEND = os.environ.get("YB_MINT_BACKEND", "cdp")  # cdp（默认，headless Chrome 铸签，无 bsk）| bsk（遗留）| http（远程 minter）
 YB_COOKIE_FILE = os.environ.get("YB_COOKIE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.txt"))  # 默认凭证文件（无 bsk 数据面）
+YB_PROXY_URL = os.environ.get("YB_PROXY_URL", "")    # 出站代理（住宅代理优先）：http://host:port 或 socks5://host:port
 YB_DATA_PLANE = os.environ.get("YB_DATA_PLANE", "auto")  # auto|page|cookie：auto=cdp 走页内、bsk 走页内+文件兜底
 YB_MINTER_URL = os.environ.get("YB_MINTER_URL", "")   # 远程 minter 服务（YB_MINT_BACKEND=http 时用）
 YB_MINTER_TOKEN = os.environ.get("YB_MINTER_TOKEN", "")  # minter 服务鉴权（X-Minter-Key）
@@ -1085,9 +1086,27 @@ def _flatten_messages(messages: list) -> str:
 
 
 # ---------------- OpenAI 端点 ----------------
+def _screenshot_png(m):
+    """CDP 截图（返回图片响应）。"""
+    import base64 as _b64
+    with m._lock:
+        ws = m._page_ws
+        if ws is None:
+            ws = m._ensure_page()
+        ws.settimeout(30)
+        ws.send(json.dumps({"id": 40, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
+        deadline = time.time() + 25
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == 40:
+                return Response(content=_b64.b64decode(msg["result"]["data"]), media_type="image/png")
+    return JSONResponse({"error": "截图超时"}, status_code=504)
+
+
 @app.get("/login")
 async def login_page(req: Request):
-    """headless 部署模式的扫码入口：返回当前元宝页面的截图（含登录二维码）。需门禁 key。"""
+    """headless 部署模式的扫码入口：返回当前元宝页面的截图（含登录二维码）。需门禁 key。
+    支持 ?tab=wechat|phone 先切换到对应登录方式（wechat 会刷新二维码）。"""
     cred = _check_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
@@ -1097,17 +1116,16 @@ async def login_page(req: Request):
         import base64
         import cdp_minter
         m = cdp_minter.get_minter()
-        with m._lock:
-            ws = m._ensure_page()
-            ws.settimeout(30)
-            ws.send(json.dumps({"id": 30, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
-            deadline = time.time() + 25
-            while time.time() < deadline:
-                msg = json.loads(ws.recv())
-                if msg.get("id") == 30:
-                    b64 = msg["result"]["data"]
-                    return Response(content=base64.b64decode(b64), media_type="image/png")
-            return JSONResponse({"error": "截图超时"}, status_code=504)
+        tab = (req.query_params.get("tab") or "").strip().lower()
+        # 注意：evaluate 内部自带锁，禁止在外层再抢（跨线程/同线程双重加锁均死锁）
+        m._ensure_page()
+        if tab in ("wechat", "phone"):
+            names = "['微信','WeChat']" if tab == "wechat" else "['手机','Phone']"
+            m.evaluate("(() => { const b=[...document.querySelectorAll('*')].filter(e=>e.offsetWidth>0&&e.children.length<=2&&['登录','Log In'].includes((e.textContent||'').trim())).sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0]; if(b && !document.querySelector('.hyc-login-v2,.hyc-phone-login')) b.click(); return 'ok'; })()", timeout_s=30)
+            m.evaluate(f"(() => {{ const c=[...document.querySelectorAll('*')].filter(e=>e.offsetWidth>0&&e.children.length<=2&&{names}.includes((e.textContent||'').trim())).sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0]; if(c) c.click(); return 'ok'; }})()", timeout_s=30)
+            import time as _t
+            _t.sleep(2)
+        return await asyncio.to_thread(_screenshot_png, m)
     except Exception as e:
         return JSONResponse({"error": str(e)[:200]}, status_code=502)
 
@@ -1122,17 +1140,20 @@ JS_PHONE_SEND = """
     el.dispatchEvent(new Event('input', {bubbles: true}));
     el.dispatchEvent(new Event('change', {bubbles: true}));
   };
-  const byText = (txt, exact) => [...document.querySelectorAll('*')]
+  const byText = (txts, exact) => [...document.querySelectorAll('*')]
     .filter(e => e.offsetWidth > 0 && e.children.length <= 2)
-    .filter(e => { const t = (e.textContent || '').trim(); return exact ? t === txt : t.startsWith(txt); })
+    .filter(e => { const t = (e.textContent || '').trim();
+      return txts.some(x => exact ? t === x : t.startsWith(x)); })
     .sort((a, b) => (a.offsetWidth * a.offsetHeight) - (b.offsetWidth * b.offsetHeight))[0];
 
-  // 0) 若登录弹窗未开，先点 Log In 打开
+  // 0) 若登录弹窗未开/未到手机表单，逐级导航（中英文双语匹配）
   if (!document.querySelector('.hyc-phone-login')) {
-    const loginBtn = byText('Log In');
-    if (loginBtn) { loginBtn.click(); await sleep(1500); }
-    const phoneTab = byText('Phone', true);
-    if (phoneTab && !document.querySelector('.hyc-phone-login')) { phoneTab.click(); await sleep(1500); }
+    const loginBtn = byText(['Log In', '登录'], true) || byText(['Log In', '登录'], false);
+    if (loginBtn) { loginBtn.click(); await sleep(2500); }
+    if (!document.querySelector('.hyc-phone-login')) {
+      const phoneTab = byText(['Phone', '手机'], true) || byText(['Phone', '手机'], false);
+      if (phoneTab) { phoneTab.click(); await sleep(2000); }
+    }
   }
   if (!document.querySelector('.hyc-phone-login')) return {ok: false, step: 'open_modal', msg: '登录弹窗未出现'};
 
@@ -1141,7 +1162,7 @@ JS_PHONE_SEND = """
   if (areaEl && !areaEl.textContent.includes(p.area.replace('+', ''))) {
     areaEl.click();
     await sleep(800);
-    const opt = byText(p.area, false);
+    const opt = byText([p.area], false);
     if (!opt) return {ok: false, step: 'area', msg: '未找到区号 ' + p.area};
     opt.click();
     await sleep(500);
@@ -1260,6 +1281,63 @@ async def login_phone_verify(req: Request):
 
 import json
 import os
+
+QR_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>元宝扫码登录</title>
+<style>
+  :root { --bg:#faf9f7; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; }
+  body { margin:0; padding:20px; background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC",sans-serif; text-align:center; }
+  h1 { font-size:16px; font-weight:500; margin:0 0 12px; }
+  .wrap { max-width:520px; margin:0 auto; background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px; }
+  img { width:100%; border-radius:8px; display:block; }
+  input { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font:13px inherit; margin-bottom:10px; }
+  .row { display:flex; gap:8px; align-items:center; margin-top:10px; }
+  button { flex:1; padding:9px 12px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:8px; font:13px inherit; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  .muted { color:var(--muted); font-size:12px; margin-top:8px; }
+  .status { margin-top:8px; font-size:12px; }
+  .ok { color:#3B6D11; } .err { color:#A32D2D; }
+</style>
+</head>
+<body>
+<h1>元宝扫码登录（自动刷新）</h1>
+<div class="wrap">
+  <input id="key" type="password" placeholder="门禁 Key（浏览器本地保存）">
+  <img id="qr" alt="登录二维码">
+  <div class="row">
+    <button onclick="saveKey()">保存 Key</button>
+    <button class="ghost" onclick="refresh(true)">立即刷新</button>
+  </div>
+  <div class="status" id="st">等待 Key…</div>
+  <div class="muted">用微信扫码完成登录 · 登录态自动持久化到容器 · 已登录后此页显示当前页面</div>
+</div>
+<script>
+let KEY = localStorage.getItem('yb_key') || '';
+document.getElementById('key').value = KEY;
+const st = document.getElementById('st');
+function saveKey(){ KEY = document.getElementById('key').value.trim(); localStorage.setItem('yb_key', KEY); refresh(true); }
+async function refresh(force){
+  if (!KEY) { st.textContent='请先填写门禁 Key'; st.className='status err'; return; }
+  try {
+    const r = await fetch('/login?tab=wechat&t=' + Date.now(), { headers: { 'Authorization': 'Bearer ' + KEY } });
+    if (r.status === 401) { st.textContent='Key 无效（401）'; st.className='status err'; return; }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    document.getElementById('qr').src = URL.createObjectURL(await r.blob());
+    const t = new Date().toLocaleTimeString();
+    st.textContent = '已刷新 ' + t + ' · 每 20 秒自动刷新';
+    st.className = 'status ok';
+  } catch (e) { st.textContent = String(e); st.className = 'status err'; }
+}
+setInterval(refresh, 20000);
+if (KEY) refresh(true); else st.textContent = '请先填写门禁 Key';
+</script>
+</body>
+</html>
+"""
 
 ADMIN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1556,6 +1634,12 @@ def _pool_peers():
 async def admin_page(req: Request):
     # 页面壳免鉴权（无 Key 者需打开页面输入 Key）；所有数据端点仍校门禁
     return Response(content=ADMIN_HTML, media_type="text/html; charset=utf-8")
+
+
+@app.get("/qr", response_class=Response)
+async def qr_page(req: Request):
+    # 扫码专用页（壳免鉴权，截图走带 Key 的 fetch）
+    return Response(content=QR_HTML, media_type="text/html; charset=utf-8")
 
 
 @app.get("/pool", response_class=Response)

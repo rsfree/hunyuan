@@ -32,6 +32,32 @@ CDP_YB_URL = os.environ.get("CDP_YB_URL", "https://yuanbao.tencent.com/chat/naQi
 # 设备指纹种子：注入已知账号绑定的设备身份（避免 headless 新指纹触发风控）
 # 格式 "k1=v1;k2=v2"（localStorage 键值对）
 DEVICE_SEED = os.environ.get("YB_DEVICE_SEED", "_qimei_h38=e9632faf082420cd40bb971703000001419610")
+STEALTH_JS = """
+(() => {
+  // 平台/语言与 UA 保持一致（Mac Chrome zh-CN）
+  try { Object.defineProperty(navigator, 'platform', {get: () => 'MacIntel'}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'deviceMemory', {get: () => 8}); } catch (e) {}
+  try { Object.defineProperty(navigator, 'maxTouchPoints', {get: () => 0}); } catch (e) {}
+  // WebGL 真实渲染器伪装（headless 默认 SwiftShader，风控强特征）
+  const patch = (proto) => {
+    if (!proto) return;
+    const orig = proto.getParameter;
+    proto.getParameter = function (p) {
+      if (p === 37445) return 'Apple Inc.';      // UNMASKED_VENDOR_WEBGL
+      if (p === 37446) return 'Apple M2';        // UNMASKED_RENDERER_WEBGL
+      return orig.call(this, p);
+    };
+  };
+  try { patch(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype); } catch (e) {}
+  try { patch(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype); } catch (e) {}
+  // chrome 运行时对象补全（headless 偶缺）
+  try { if (!window.chrome) window.chrome = {}; if (!window.chrome.runtime) window.chrome.runtime = {}; } catch (e) {}
+  return 'stealth-ok';
+})()
+"""
+
 SEED_JS = """
 (() => {
   const pairs = "__SEED__".split(";").filter(Boolean);
@@ -148,9 +174,14 @@ class CDPMinter:
                 return self._page_ws
         except Exception:
             pass
-        # 重建
-        self._ensure_chrome()
+        # 重建：CDP 端点已可达（如 entrypoint 已拉起）则不再重复拉起 chromium
         ver = None
+        try:
+            ver = self._http_json("/json/version", timeout=3)
+        except Exception:
+            ver = None
+        if not ver:
+            self._ensure_chrome()
         for _ in range(30):
             try:
                 ver = self._http_json("/json/version")
@@ -165,24 +196,32 @@ class CDPMinter:
             except Exception:
                 pass
         self._browser_ws = websocket.create_connection(ver["webSocketDebuggerUrl"], timeout=60, suppress_origin=True)
+        # 1) 先开 about:blank（此时不加载元宝应用）
         r = self._ws_send(self._browser_ws, "Target.createTarget",
-                          {"url": CDP_YB_URL}, mid=901)
+                          {"url": "about:blank"}, mid=901)
         tid = r.get("targetId")  # _ws_send 已返回 result 内层
         if not tid:
             raise RuntimeError("createTarget 失败: " + json.dumps(r)[:200])
-        time.sleep(3)
+        time.sleep(1)
         targets = self._http_json("/json/list")
-        page = next(t for t in targets if t["type"] == "page" and "yuanbao" in t["url"])
+        page = next(t for t in targets if t["type"] == "page" and t["url"] == "about:blank")
         if self._page_ws:
             try:
                 self._page_ws.close()
             except Exception:
                 pass
-        self._page_ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=120, suppress_origin=True)
-        self._ws_send(self._page_ws, "Emulation.setUserAgentOverride", {"userAgent": UA}, mid=902)
+        self._page_ws = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=180, suppress_origin=True)
+        self._page_ws.settimeout(180)
+        # 2) 关键顺序：先注册 init 脚本与指纹覆盖，再导航（否则脚本对首个文档不生效）
+        self._ws_send(self._page_ws, "Emulation.setUserAgentOverride",
+                      {"userAgent": UA, "platform": "MacIntel", "acceptLanguage": "zh-CN,zh,en"}, mid=902)
         self._ws_send(self._page_ws, "Page.addScriptToEvaluateOnNewDocument",
                       {"source": SEED_JS}, mid=904)
-        self._page_ws.settimeout(120)
+        self._ws_send(self._page_ws, "Page.addScriptToEvaluateOnNewDocument",
+                      {"source": STEALTH_JS}, mid=905)
+        self._ws_send(self._page_ws, "Page.enable", mid=906)
+        self._ws_send(self._page_ws, "Page.navigate", {"url": CDP_YB_URL}, mid=907)
+        time.sleep(3)
         # 等应用 chunk 就绪
         for _ in range(60):
             r = self._ws_send(self._page_ws, "Runtime.evaluate",

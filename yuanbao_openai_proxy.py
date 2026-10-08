@@ -47,25 +47,30 @@ YUANBAO_TAB_ID = os.environ.get("YUANBAO_TAB_ID", "auto")  # agent 窗口里的�
 YUANBAO_AGENT_ID = os.environ.get("YUANBAO_AGENT_ID", "auto")  # naQivTmsDa
 YUANBAO_CONVERSATION = os.environ.get("YUANBAO_CONVERSATION", "")  # 固定会话；空=每请求新建
 YUANBAO_API_KEY = os.environ.get("YUANBAO_API_KEY", "")  # 门禁 key；空=不校验（客户端 Bearer 随意）
+YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(不进历史，反风控)；0=普通
+YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
+YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
+YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙")自动退避重试次数
 PORT = int(os.environ.get("YUANBAO_PROXY_PORT", "8177"))
 
+# 静态头骨架：易变字段（UA/os_version/webversion/commit-tag/设备三件）运行时从页面动态覆盖
 STATIC_HEADERS = {
     "X-Input-Type": "text",
     "X-Requested-With": "XMLHttpRequest",
     "X-Instance-ID": "5",
     "X-Source": "web",
     "X-Language": "zh-CN",
-    "X-device-id": "19c100d220910063ab8e4f54c0cba26e4d7c4bd2b8",  # 与设备相关，失效时从真实请求抄
+    "X-device-id": "19c100d220910063ab8e4f54c0cba26e4d7c4bd2b8",  # 动态覆盖
     "X-HY106": "",
-    "X-os_version": "Mac OS(10.15.7)-Blink",
+    "X-os_version": "Mac OS(10.15.7)-Blink",                     # 动态覆盖
     "X-Platform": "mac",
     "X-webdriver": "0",
     "X-ybuitest": "0",
     "X-Exp-Params": "enableNewPcStyle=2",
     "x-web-ch-id": "null",
     "X-Web-Third-Source": "main",
-    "x-commit-tag": "02746073",
-    "X-WebVersion": "2.87.2",
+    "x-commit-tag": "02746073",                                  # 动态覆盖
+    "X-WebVersion": "2.87.2",                                    # 动态覆盖
 }
 
 # OpenAI 风格模型名 → 元宝 chatModelId
@@ -78,7 +83,21 @@ MODEL_MAP = {
     "deepseek-r1": "deep_seek",
     "deepseek-reasoner": "deep_seek",
     "dall-e-3": "hunyuan_gpt_175B_0404",  # 生图走 images 端点
+    # hy-image 系列别名：chat 门带这些名字 → 生图管道；images 端点原样接受
+    "hy-image": "hunyuan_gpt_175B_0404",
+    "hy-image-3.5": "hunyuan_gpt_175B_0404",
+    "hy-image-v3.5": "hunyuan_gpt_175B_0404",
+    "hy-image-v3.5-preview": "hunyuan_gpt_175B_0404",
+    "hy-image-4": "hunyuan_gpt_175B_0404",
 }
+
+IMAGE_MODEL_PREFIXES = ("hy-image", "dall-e")
+
+
+def _is_image_model(name: str) -> bool:
+    """hy-image-* / dall-e-* 系列一律视为生图模型（hy-image-* 通配别名）。"""
+    n = (name or "").lower()
+    return n.startswith(IMAGE_MODEL_PREFIXES)
 
 app = FastAPI(title="yuanbao-openai-proxy")
 
@@ -327,6 +346,121 @@ def _ensure_page() -> dict:
             time.sleep(1)
 
 
+# ---------------- 风控对策：签名缓存 / 动态指纹 / 限速 / 软拒退避 ----------------
+_sig_cache: dict = {}          # {uskey, md5, ts, minted_at}
+_fp_cache: dict = {}           # 动态指纹头缓存 {headers, at}
+_fp_TTL = 600.0                # 指纹 10 分钟刷新（跟随元宝前端发版）
+_last_req_at: dict = {}        # 凭证/会话维度限速 {"browser": ts, cookie前8位: ts}
+_softreject_count = 0          # 软拒计数（观测用）
+
+JS_FINGERPRINT = """
+(() => {
+  const arr = Object.keys(window).filter(k=>k.startsWith('webpackChunk')).map(k=>window[k])[0];
+  let req; arr.push([['fp'+Date.now()], {}, (r)=>{req=r}]);
+  const modSig = req(77004);
+  const sdk = modSig.I5(modSig.PU);
+  const h38 = sdk.getLocalQimei36().h38;
+  // webversion/commit-tag：从 rumt 上报 URL 里解析（version=2.87.2__02746073-modern）
+  let ver = null, tag = null;
+  try {
+    for (const e of performance.getEntriesByType('resource')) {
+      const m = (e.name||'').match(/version=([\\d.]+)__([0-9a-f]+)-/);
+      if (m) { ver = m[1]; tag = m[2]; break; }
+    }
+  } catch (e) {}
+  const ua = navigator.userAgent;
+  let osv = 'Mac OS(10.15.7)-Blink';
+  const m = ua.match(/(Mac OS X|Windows NT [\\d.]+|Android [\\d.]+|CrOS \\w+ [\\d.]+)[^)]*?([\\d__.]+)?/);
+  if (ua.includes('Mac OS X') && m) {
+    const v = (m[2] || '').replace(/_/g, '.');
+    osv = 'Mac OS(' + (v || '10.15.7') + ')-Blink';
+  } else if (ua.includes('Windows')) {
+    osv = 'Windows' + (m && m[2] ? '(' + m[2].replace(/_/g,'.') + ')-Blink' : '-Blink');
+  }
+  return {h38, osv, ver, tag, ua: navigator.userAgent};
+})()
+"""
+
+
+def _dynamic_fp(tab: str) -> dict:
+    """动态指纹头：UA/os_version/webversion/commit-tag/设备三件 全部跟随真实页面。
+    缓存 10 分钟 —— 元宝发版后代理自动跟上，不残留陈旧版本指纹。"""
+    global _fp_cache
+    now = time.time()
+    if _fp_cache.get("headers") and now - _fp_cache.get("at", 0) < _fp_TTL:
+        return _fp_cache["headers"]
+    try:
+        fp = _ev(JS_FINGERPRINT, tab_id=tab)
+    except Exception:
+        fp = None
+    if not fp or not fp.get("h38"):
+        return dict(STATIC_HEADERS)  # 页面异常时退回骨架，不阻塞请求
+    h = dict(STATIC_HEADERS)
+    h["X-HY92"] = fp["h38"]
+    h["X-HY93"] = h["X-device-id"]  # 实抓：HY93 == device-id，h38 走 HY92
+    h["X-os_version"] = fp.get("osv") or h["X-os_version"]
+    if fp.get("ver"):
+        h["X-WebVersion"] = fp["ver"]
+    if fp.get("tag"):
+        h["x-commit-tag"] = fp["tag"]
+    h["user-agent"] = fp.get("ua") or h.get("user-agent", "")
+    _fp_cache = {"headers": h, "at": now}
+    return h
+
+
+def get_sig(tab: str, force: bool = False) -> dict:
+    """签名三件套缓存复用（TTL 内复用同一套，减少铸签频率；实测可复用）。
+    铸签前注入动态指纹头（UA/webversion/commit-tag 跟随真实页面）。"""
+    now = time.time()
+    if not force and _sig_cache.get("sig") and now - _sig_cache.get("minted_at", 0) < YB_SIG_TTL:
+        return _sig_cache["sig"]
+    fp_headers = _dynamic_fp(tab)
+    _ev("window.__ybStaticHeaders = " + json.dumps(fp_headers) + "; 'ok'", tab_id=tab)
+    sig = _mint_only(tab)
+    _sig_cache.clear()
+    _sig_cache.update({"sig": sig, "minted_at": now})
+    return sig
+
+
+def pace(key: str):
+    """同凭证限速：距上次请求不足 YB_MIN_INTERVAL 则等待。"""
+    last = _last_req_at.get(key, 0)
+    wait = YB_MIN_INTERVAL - (time.time() - last)
+    if wait > 0:
+        time.sleep(wait)
+    _last_req_at[key] = time.time()
+
+
+def is_softreject(result: dict) -> bool:
+    """风控软拒识别：HTTP 200 包着 error 事件（服务繁忙/限流）。"""
+    if not isinstance(result, dict):
+        return False
+    if result.get("status") != 200:
+        return False
+    blob = result.get("raw") or result.get("text") or ""
+    return ("服务繁忙" in blob) or ('"type":"error"' in blob and not result.get("urls"))
+
+
+def with_softretry(fn, sig_tab: str, cookie_mode: bool = False):
+    """软拒自动退避重试：识别"服务繁忙"→ 强制重铸签名 + 指数退避 → 重试。"""
+    global _softreject_count
+    result = fn()
+    attempt = 0
+    while is_softreject(result) and attempt < YB_SOFTRETRY:
+        attempt += 1
+        _softreject_count += 1
+        wait = 2.0 * attempt
+        time.sleep(wait)
+        # 强制刷新签名（软拒常因签名时效/风控计数）
+        if not cookie_mode:
+            try:
+                get_sig(sig_tab, force=True)
+            except Exception:
+                pass
+        result = fn()
+    return result
+
+
 # ---------------- 页内 JS 片段 ----------------
 JS_BOOT = """
 (() => {
@@ -357,7 +491,7 @@ JS_CREATE_CONV = """
 
 JS_CHAT = """
 (async (p) => {
-  const {conv, agentId, prompt, chatModelId, sig} = p;
+  const {conv, agentId, prompt, chatModelId, temp, sig} = p;
   const BASE = 'hunyuan_gpt_175B_0404';
   const chatModelExtInfo = JSON.stringify({
     modelId: BASE,
@@ -368,7 +502,7 @@ JS_CHAT = """
   const body = {
     model: 'gpt_175B_0404',
     prompt, plugin: '', displayPrompt: prompt, displayPromptType: 1,
-    agentId, isTemporary: false, projectId: '',
+    agentId, isTemporary: !!temp, projectId: '',
     chatModelId,
     supportFunctions: ['openAutoSearchSwitch', 'autoInternetSearch'],
     docOpenid: '',
@@ -588,7 +722,7 @@ JS_UPLOAD_REF = """
 
 JS_CHAT_I2I = """
 (async (p) => {
-  const {conv, agentId, prompt, multimedia, resolution, ratio, chatModelId, sig} = p;
+  const {conv, agentId, prompt, multimedia, resolution, ratio, chatModelId, temp, sig} = p;
   const BASE = 'hunyuan_gpt_175B_0404';
   const igen = {model: 'Hy Image 3.5', resolution: resolution || '1.5K'};
   if (ratio) igen.ratio = ratio;
@@ -605,7 +739,7 @@ JS_CHAT_I2I = """
     chatModelExtInfo: JSON.stringify({modelId: BASE, agentModeModelSetting: {modelId: chatModelId}, supportFunctions: {internetSearch: ''}, internetSearch: 'autoInternetSearch'}),
     extra: {image_gen_param: igen},
     multimedia: multimedia,
-    agentId, isTemporary: false, projectId: '',
+    agentId, isTemporary: !!temp, projectId: '',
     supportFunctions: ['openAutoSearchSwitch', 'autoInternetSearch'],
     docOpenid: '',
     options: {imageIntention: {needIntentionModel: true, backendUpdateFlag: 2, intentionStatus: true}},
@@ -656,7 +790,7 @@ def _yb_chat_body(conv: str, agent_id: str, prompt: str, chat_model: str) -> dic
     return {
         "model": "gpt_175B_0404",
         "prompt": prompt, "plugin": "", "displayPrompt": prompt, "displayPromptType": 1,
-        "agentId": agent_id, "isTemporary": False, "projectId": "",
+        "agentId": agent_id, "isTemporary": YUANBAO_TEMP_CONV == "1", "projectId": "",
         "chatModelId": chat_model,
         "chatModelExtInfo": json.dumps({
             "modelId": BASE, "agentModeModelSetting": {"modelId": chat_model},
@@ -672,8 +806,8 @@ def _yb_chat_body(conv: str, agent_id: str, prompt: str, chat_model: str) -> dic
     }
 
 
-def _yb_i2i_body(conv: str, agent_id: str, prompt: str, multimedia: list, resolution: str, chat_model: str, ratio: Optional[str] = None) -> dict:
-    """图生图 body（与页内 JS_CHAT_I2I 同构，msgScene 12）。"""
+def _yb_image_body(conv: str, agent_id: str, prompt: str, multimedia: list, resolution: str, chat_model: str, ratio: Optional[str] = None) -> dict:
+    """生图 body（出站统一）：带 multimedia → i2i（msgScene 12）；无 → t2i（msgScene 13）。"""
     BASE = "hunyuan_gpt_175B_0404"
     full_prompt = "帮我生成图片：" + prompt
     igen = {"model": "Hy Image 3.5", "resolution": resolution or "1.5K"}
@@ -684,7 +818,7 @@ def _yb_i2i_body(conv: str, agent_id: str, prompt: str, multimedia: list, resolu
         "prompt": full_prompt, "plugin": "Adaptive",
         "displayPrompt": full_prompt, "displayPromptType": 1,
         "question": full_prompt,
-        "skillIdParam": "ai_image", "msgScene": 12,
+        "skillIdParam": "ai_image", "msgScene": 12 if multimedia else 13,
         "chatModelId": chat_model,
         "chatModelExtInfo": json.dumps({
             "modelId": BASE, "agentModeModelSetting": {"modelId": chat_model},
@@ -692,7 +826,7 @@ def _yb_i2i_body(conv: str, agent_id: str, prompt: str, multimedia: list, resolu
         }),
         "extra": {"image_gen_param": igen},
         "multimedia": multimedia,
-        "agentId": agent_id, "isTemporary": False, "projectId": "",
+        "agentId": agent_id, "isTemporary": YUANBAO_TEMP_CONV == "1", "projectId": "",
         "supportFunctions": ["openAutoSearchSwitch", "autoInternetSearch"],
         "docOpenid": "",
         "options": {"imageIntention": {"needIntentionModel": True, "backendUpdateFlag": 2, "intentionStatus": True}},
@@ -714,42 +848,56 @@ def _mint_only(tab: str) -> dict:
 
 
 def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
-                     image_refs: list, resolution: str, ratio: Optional[str] = None) -> dict:
+                     image_refs: list, resolution: str, ratio: Optional[str] = None,
+                     force_image: bool = False) -> dict:
     """凭证透传模式：数据面全走代理出站 HTTP（签名仍借页面铸造）。
-    返回与浏览器路径同构的 result dict。"""
+    返回与浏览器路径同构的 result dict。含限速 + 软拒退避重试。
+    force_image=True 时（chat 门生图模型）无参考图也走文生图管道。"""
     ctx = _ensure_page()
+    pace("ck:" + cookie[:16])
     with _bsk_lock:
-        sig = _mint_only(ctx["tabId"])
-        if YUANBAO_CONVERSATION:
-            conv = YUANBAO_CONVERSATION
-        else:
-            r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
-                              {"agentId": agent_id}, sig, agent_id)
-            if r["status"] == 401:
-                return {"status": 401, "text": r["text"]}
-            conv = json.loads(r["text"]).get("id")
-            if not conv:
-                raise RuntimeError("创建会话失败: " + r["text"][:150])
-        if image_refs:
-            multimedia = []
-            for i, ref in enumerate(image_refs[:4]):
-                uri = _ref_to_data_uri(ref)
-                head, _, b64data = uri.partition(";base64,")
-                mime = head[5:].split(";")[0] or "image/png"
-                if not mime.startswith("image/"):
-                    mime = "image/png"
-                ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
-                multimedia.append(_yb_upload_ref(cookie, agent_id, b64data, f"ref_{i}.{ext}", mime))
-            body = _yb_i2i_body(conv, agent_id, prompt, multimedia, resolution, chat_model, ratio)
-            r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv,
-                              extra={"X-Event-Input-Type": "15"})
-            parsed = _parse_yb_sse_common(r["text"])
-            return {"status": r["status"], "urls": parsed["urls"], "wmUrls": parsed["wmUrls"],
-                    "text": parsed["text"], "error": parsed["error"],
-                    "raw": None if parsed["urls"] else r["text"][:400]}
-        body = _yb_chat_body(conv, agent_id, prompt, chat_model)
-        r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv)
-        return {"status": r["status"], "text": r["text"]}
+        def run_once(sig):
+            if YUANBAO_CONVERSATION:
+                conv = YUANBAO_CONVERSATION
+            else:
+                r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
+                                  {"agentId": agent_id}, sig, agent_id)
+                if r["status"] == 401:
+                    return {"status": 401, "text": r["text"]}
+                conv = json.loads(r["text"]).get("id")
+                if not conv:
+                    raise RuntimeError("创建会话失败: " + r["text"][:150])
+            if image_refs or force_image:
+                multimedia = []
+                for i, ref in enumerate(image_refs[:4]):
+                    uri = _ref_to_data_uri(ref)
+                    head, _, b64data = uri.partition(";base64,")
+                    mime = head[5:].split(";")[0] or "image/png"
+                    if not mime.startswith("image/"):
+                        mime = "image/png"
+                    ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
+                    multimedia.append(_yb_upload_ref(cookie, agent_id, b64data, f"ref_{i}.{ext}", mime))
+                body = _yb_image_body(conv, agent_id, prompt, multimedia, resolution, chat_model, ratio)
+                r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv,
+                                  extra={"X-Event-Input-Type": "15"})
+                parsed = _parse_yb_sse_common(r["text"])
+                return {"status": r["status"], "urls": parsed["urls"], "wmUrls": parsed["wmUrls"],
+                        "text": parsed["text"], "error": parsed["error"],
+                        "raw": None if parsed["urls"] else r["text"][:400]}
+            body = _yb_chat_body(conv, agent_id, prompt, chat_model)
+            r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv)
+            return {"status": r["status"], "text": r["text"]}
+
+        sig = get_sig(ctx["tabId"])
+        result = run_once(sig)
+        # 软拒退避：强制重铸签名重试
+        attempt = 0
+        while is_softreject(result) and attempt < YB_SOFTRETRY and result.get("status") == 200:
+            attempt += 1
+            time.sleep(2.0 * attempt)
+            sig = get_sig(ctx["tabId"], force=True)
+            result = run_once(sig)
+        return result
 
 
 # ---------------- 元宝调用封装 ----------------
@@ -841,7 +989,8 @@ def _flatten_messages(messages: list) -> str:
 @app.get("/v1/models")
 async def list_models():
     now = int(time.time())
-    ids = ["hunyuan", "hunyuan-t1", "deepseek-v3", "deepseek-r1", "dall-e-3"]
+    ids = ["hunyuan", "hunyuan-t1", "deepseek-v3", "deepseek-r1",
+           "hy-image", "hy-image-3.5", "hy-image-v3.5", "hy-image-v3.5-preview", "dall-e-3"]
     return {"object": "list", "data": [{"id": i, "object": "model", "created": now, "owned_by": "tencent-yuanbao"} for i in ids]}
 
 
@@ -871,6 +1020,8 @@ async def chat_completions(req: Request):
 
     created = int(time.time())
     comp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
+    # hy-image-* / dall-e-* 生图模型：chat 门直接走生图管道（无图 t2i，带图 i2i）
+    image_flow = bool(image_refs) or _is_image_model(model_in)
 
     try:
         if cookie_str:
@@ -878,7 +1029,8 @@ async def chat_completions(req: Request):
             result = _cookie_mode_run(cookie_str, _ensure_page()["agentId"], prompt,
                                       chat_model, image_refs,
                                       _size_to_resolution(body.get("size", "")),
-                                      _size_to_ratio(body.get("size", "")))
+                                      _size_to_ratio(body.get("size", "")),
+                                      force_image=_is_image_model(model_in))
         else:
             ctx = _ensure_page()
             tab = ctx["tabId"]
@@ -888,7 +1040,7 @@ async def chat_completions(req: Request):
                     conv = YUANBAO_CONVERSATION
                 else:
                     conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
-                sig = _mint_and_inject(tab)
+                sig = get_sig(tab)
                 if image_refs:
                     # ---- 图生图前门：上传参考图 → msgScene 12 生图 ----
                     import base64 as _b64
@@ -909,6 +1061,12 @@ async def chat_completions(req: Request):
                         f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'sig': sig})})",
                         tab_id=tab, timeout=300,
                     )
+                elif image_flow:
+                    # ---- chat 门生图模型（hy-image-* 等）：文生图 ----
+                    result = _ev(
+                        f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'sig': sig})})",
+                        tab_id=tab, timeout=300,
+                    )
                 else:
                     # ---- 纯文本聊天 ----
                     result = _ev(
@@ -921,7 +1079,7 @@ async def chat_completions(req: Request):
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
 
     # ---- 图生图：data[] 包回 choices[0].message.content parts ----
-    if image_refs:
+    if image_flow:
         auth_err = _yb_auth_error(result)
         if auth_err:
             return auth_err
@@ -1064,6 +1222,8 @@ async def images_generations(req: Request):
     else:
         image_refs = []
     chat_model = MODEL_MAP.get(body.get("model", "hunyuan"), body.get("model") or "hunyuan_gpt_175B_0404")
+    if _is_image_model(chat_model):
+        chat_model = "hunyuan_gpt_175B_0404"  # 生图端点里 model 仅是别名，chatModelId 归一到基础模型
     n = min(int(body.get("n", 1) or 1), 4)
     resolution = _size_to_resolution(body.get("size", ""))
 

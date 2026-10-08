@@ -178,3 +178,17 @@ hy_token=<RSA加密blob约900B>; hy_user=<32位hex userId>
 透传模式架构：cookie 来自客户端，数据面走代理出站 HTTP（conversation/create、
 chat、genUploadInfo+COS PUT 全出站）；签名三件套仍借页面铸造（uskey 离线不可得）。
 ⚠️ 跨设备风险未验证：uskey 绑本机 h38，若 cookie 来自其他设备登录，可能 401。
+
+## 10. 反风控加固（v2）
+
+| 对策 | 实现 |
+|---|---|
+| 签名复用 | 三件套缓存 TTL 60s（`YB_SIG_TTL`），实测可复用；软拒时强制重铸 |
+| 动态指纹 | UA/os_version/webversion/commit-tag/HY92 运行时从页面提取（10 分钟缓存），元宝发版自动跟上 |
+| 限速 | 同凭证最小间隔 `YB_MIN_INTERVAL=2s` |
+| 软拒退避 | "服务繁忙" → 强制重铸签名 + 指数退避重试 `YB_SOFTRETRY=1` 次 |
+| 临时会话 | `YUANBAO_TEMP_CONV=1`（默认开）：isTemporary=true，生成会话不进账号历史 |
+| 401 明确化 | 透传凭证过期 → code=yuanbao_credential_expired |
+
+hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-image-v3.5 / hy-image-v3.5-preview`，
+无参考图=文生图（msgScene 13），带 image_url=图生图（msgScene 12），返回 content parts 图组。

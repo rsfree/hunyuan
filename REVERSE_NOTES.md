@@ -260,3 +260,28 @@ chromium `--proxy-server` 不支持 URL 内嵌凭据（socks5 认证无法直传
 `socks_bridge.py`：本地无认证 socks5（127.0.0.1:1080）→ 上游带认证 `2089`（域名哈希恒定出口）。
 entrypoint 在 `YB_BROWSER_PROXY` 设置时自动起桥并把 chromium 指向它。
 实测：浏览器出口 IP 恒定 `38.6.213.230`（两次请求一致），元宝页面经代理正常加载。
+
+## 16. 无水印保存（账号级开关）— 完整契约
+
+**定位**：`yb_v2_yb-component.*.js` chunk；模块内常量 `FIELD = "watermarkConfig"`。
+同一 chunk 里另有 `yuanbao:watermark-free-save-agreement-accepted`（协议标记 localStorage key）。
+
+```
+资质门禁: GET  /api/info/general          → graySwitches.grayKeyWithoutWatermark !== false
+读配置  : POST /api/userinfo/getuserconfig {scene:1, configFields:["watermarkConfig"]}
+写配置  : POST /api/updateuserinfo         {updateFields:["watermarkConfig"],
+                                            userConfig:{watermarkConfig:{...现值, ...patch}}}
+上报配额: POST /api/userinfo/report_invisible_watermark_save {} → {quotaExceeded: bool}
+前端语义: d(on) = update({saveWithoutWatermark: on, ...(on ? {hasPopupAgreement:true} : {})})
+```
+
+- **不需要签名**（cookie + 静态头即可）⇒ 可完全脱离浏览器调用
+- 实测读写往返：`{hasPopupAgreement:true, saveWithoutWatermark:true}` → 写 false → 复读 false → 写 true → 复读 true
+- 注意 `whitelist_watermark` / `watermark`（`_app` chunk，模块 47824）是**远程配置白名单**
+  （来自 `v.qq.com/cache/wuji/object/...` 的 `remove_user_info`/`watermark`/`whitelist_watermark`），
+  **与用户开关不是一回事**，别混
+- 与 `/api/image/removewatermark`（图像编辑器去水印，见 §12）也是两回事：
+  前者是"下载不带水印"的账号开关，后者是给外部图去水印的实验性能力
+
+**踩坑**：读 `/api/info/general` 时若把响应体截断到几百字符，`graySwitches` 会被截断导致
+JSON 解析失败 → 灰度判定恒为 `null`。这类"大响应体"接口要放宽截断上限。

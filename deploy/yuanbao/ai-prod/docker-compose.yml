@@ -1,23 +1,48 @@
 services:
   yuanbao-proxy:
     build: .
-    container_name: yuanbao-proxy
+    image: yuanbao-proxy:latest      # 多账号时各实例共享同一镜像（build 一次，运行 N 份）
+    container_name: yuanbao-${YB_INSTANCE_NAME:-acc01}
     restart: unless-stopped
+    # 🔴 给足优雅关闭时间：entrypoint 收到 SIGTERM 后先停 API，再让 chromium 收尾把
+    #    cookie/localStorage flush 到 profile。时间太短会被 SIGKILL ⇒ 掉登录态。
+    stop_grace_period: 30s
     shm_size: 1g
     ports:
-      - "127.0.0.1:39177:39177"        # 只绑回环，公网入口走 nginx
+      - "127.0.0.1:${YB_PORT:-39177}:39177"   # 只绑回环，公网入口走 nginx
     volumes:
-      - ./auths/cookie.txt:/auths/cookie.txt:ro
-      - ./auths/chrome-profile:/data/chrome-profile   # 持久化浏览器 profile（登录态）
+      # 每实例独立 profile（= 一个账号）；多账号时改 YB_AUTH_DIR 指向各自目录
+      - ./auths/${YB_INSTANCE_NAME:-acc01}/cookie.txt:/auths/cookie.txt:ro
+      - ./auths/${YB_INSTANCE_NAME:-acc01}/chrome-profile:/data/chrome-profile
+      # 调用统计：JSONL 明细 + 内存聚合（落在账号自己的目录里，跟着账号走）
+      - ./auths/${YB_INSTANCE_NAME:-acc01}/stats:/data/stats
+      # 号池账号状态（启用/禁用/隔离/剔除），跟着账号走
+      - ./auths/${YB_INSTANCE_NAME:-acc01}/state:/data/state
     environment:
       YUANBAO_API_KEY: "${YUANBAO_API_KEY}"
+      # 号池内部只读 key（各实例共享）：让任一实例都能查到整池状态；不能当 API key 用
+      YB_FLEET_KEY: "${YB_FLEET_KEY:-}"
+      # 保活：定时用 cookie 探活 GET /api/info/general（0=关闭）。默认 15 分钟
+      YB_KEEPALIVE_SEC: "${YB_KEEPALIVE_SEC:-900}"
+      # 调用统计保留天数（明细 JSONL 自动清理）
+      YB_STATS_KEEP_DAYS: "${YB_STATS_KEEP_DAYS:-30}"
+      # 新号登录后自动开启「无水印保存」
+      YB_AUTO_WATERMARK: "${YB_AUTO_WATERMARK:-1}"
+      # 号池生命周期自动规则 + 轮询入口
+      YB_AUTO_DISABLE_AFTER: "${YB_AUTO_DISABLE_AFTER:-3}"
+      YB_AUTO_REENABLE_AFTER: "${YB_AUTO_REENABLE_AFTER:-3}"
+      YB_AUTO_EJECT_AFTER_DAYS: "${YB_AUTO_EJECT_AFTER_DAYS:-0}"
+      YB_ROUTER: "${YB_ROUTER:-1}"
       YB_MINT_BACKEND: "cdp"
-      YB_DATA_PLANE: "cookie"
-      CDP_HTTP: "http://127.0.0.1:9222"   # 同容器 loopback（多 worker 共享）
-      YB_WORKERS: "4"
-      YB_INSTANCE_NAME: "yuanbao-acc01"
-      YB_BASE_URL: "https://yuanbao.1task.cn"
-      YB_POOL_PEERS: "acc01=https://yuanbao.1task.cn"   # 号池总览数据源（加账号时在此追加 name=url）
+      YB_DATA_PLANE: "${YB_DATA_PLANE:-page}"   # page=用容器自带登录态（扫码登录后免 cookie）；cookie=出站HTTP+文件cookie
+      CDP_HTTP: "http://127.0.0.1:9222"   # 同容器 loopback
+      # 🔴 页面数据面必须单 worker：每个 uvicorn worker 进程各自持有一个 CDP 页 +
+      #    进程内锁（_bsk_lock 不跨进程）⇒ 多 worker = 多个重复标签页 + 无互斥（截图/会话错乱）
+      YB_WORKERS: "${YB_WORKERS:-1}"
+      YB_INSTANCE_NAME: "${YB_INSTANCE_NAME:-acc01}"
+      YB_BASE_URL: "${YB_BASE_URL:-https://yuanbao.1task.cn}"
+      # 号池总览数据源：把**所有**实例列进来（含自己），任一实例都能看到整池
+      YB_POOL_PEERS: "${YB_POOL_PEERS:-acc01=https://yuanbao.1task.cn}"
       # === 代理池（凭据只放 .env，绝不入库）===
       # 数据面（聊天/生图出站）逐请求轮换出口 IP —— 2088 = 池的"每请求换 IP"端口
       YB_PROXY_POOL: "${YB_PROXY_POOL:-}"

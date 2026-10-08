@@ -48,6 +48,29 @@ YUANBAO_TAB_ID = os.environ.get("YUANBAO_TAB_ID", "auto")  # agent 窗口里的�
 YUANBAO_AGENT_ID = os.environ.get("YUANBAO_AGENT_ID", "auto")  # naQivTmsDa
 YUANBAO_CONVERSATION = os.environ.get("YUANBAO_CONVERSATION", "")  # 固定会话；空=每请求新建
 YUANBAO_API_KEY = os.environ.get("YUANBAO_API_KEY", "")  # 门禁 key；空=不校验（客户端 Bearer 随意）
+# 号池内部互通 key：仅用于**管理面只读端点**（/admin/state|keepalive|peers|pool）的实例间互查，
+# 让"任一实例都能看到整池状态"。它**不能**当 API key 调 /v1/*（与实例 key 权限隔离）。
+YB_FLEET_KEY = os.environ.get("YB_FLEET_KEY", "").strip()
+YB_INSTANCE_NAME_ENV = os.environ.get("YB_INSTANCE_NAME", "yuanbao-acc01")
+YB_BASE_URL_ENV = os.environ.get("YB_BASE_URL", "").rstrip("/")
+# 保活：定时用 cookie 探活（GET /api/info/general），0=关闭。默认 15 分钟
+YB_KEEPALIVE_SEC = int(os.environ.get("YB_KEEPALIVE_SEC", "900"))
+# 保活告警阈值：连续失败 N 次后日志升级为 error（便于外部日志告警）
+YB_KEEPALIVE_ALERT = int(os.environ.get("YB_KEEPALIVE_ALERT", "3"))
+# 无水印保存（账号级开关）：新号登录后自动开启。1=开（默认），0=关
+YB_AUTO_WATERMARK = os.environ.get("YB_AUTO_WATERMARK", "1") == "1"
+# 调用统计：YBY_STATS_DIR 放 JSONL 明细 + 内存聚合；保留天数
+YB_STATS_DIR = os.environ.get("YB_STATS_DIR", "/data/stats")
+YB_STATS_KEEP_DAYS = int(os.environ.get("YB_STATS_KEEP_DAYS", "30"))
+# 号池生命周期：状态文件目录 + 自动规则阈值
+YB_STATE_DIR = os.environ.get("YB_STATE_DIR", "/data/state")
+YB_AUTO_DISABLE_AFTER = int(os.environ.get("YB_AUTO_DISABLE_AFTER", "3"))       # 连续保活失败几次→自动隔离
+YB_AUTO_REENABLE_AFTER = int(os.environ.get("YB_AUTO_REENABLE_AFTER", "3"))     # 连续成功几次→自动恢复（0=不自动恢复）
+YB_AUTO_EJECT_AFTER_DAYS = int(os.environ.get("YB_AUTO_EJECT_AFTER_DAYS", "0")) # 隔离超几天→自动剔除（0=关闭）
+YB_ROUTER = os.environ.get("YB_ROUTER", "1") == "1"                            # 是否开放 /pool/v1 轮询入口
+_WATERMARK: dict = {"at": 0, "ok": None, "enabled": None, "detail": "", "attempts": 0}
+_WM_RUNNING = False
+_KEEPALIVE: dict = {"count": 0, "fail_streak": 0, "at": 0, "ok": None, "status": None, "detail": ""}
 YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(不进历史，反风控)；0=普通
 YB_DELETE_CONV = os.environ.get("YB_DELETE_CONV", "1")    # 1=生成完自动删除本次创建的会话（历史零残留）
 YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")
@@ -227,6 +250,10 @@ def _check_auth(request: Request):
     if yb_cookie:
         return ("cookie", yb_cookie)
     value = _bearer_value(request)
+    if not value:
+        # 也允许从查询串取（?k= / ?key=）：便于 <img src="/login?k=..."> 直链展示截图，
+        # 免去 fetch+blob（内嵌预览面板/沙箱 iframe 里 blob: 常被拦，导致裂图）
+        value = (request.query_params.get("k") or request.query_params.get("key") or "").strip()
     if value and _looks_like_cookie(value):
         return ("cookie", value)
     if YUANBAO_API_KEY:
@@ -240,12 +267,358 @@ def _check_auth(request: Request):
     return None
 
 
+def _check_admin_panel_auth(request: Request):
+    """管理面**只读**端点鉴权：接受本实例 key 或 YB_FLEET_KEY（供实例间互查号池状态）。
+
+    与 _check_auth 的差别只在"多认一把 fleet key"，权限边界不变：
+    fleet key 不能用来调 /v1/chat|images|models（那些仍只认实例 key）。
+    """
+    if YB_FLEET_KEY:
+        v = _bearer_value(request) or (request.query_params.get("k") or "").strip()
+        if v == YB_FLEET_KEY:
+            return None
+    return _check_auth(request)
+
+
 # ---------------- 出站 HTTP（凭证透传模式：客户端 cookie + 页内铸签名） ----------------
 import base64 as _b64mod
 import urllib.request as _ureq
 import urllib.error as _uerr
 
 _OPENER = _ureq.build_opener(_ureq.ProxyHandler({}))  # 直连，不吃环境代理（信任边界同 curl --noproxy '*'）
+
+
+# ---------------- 账号保活（keepalive） ----------------
+# 思路：`GET /api/info/general` 只需 cookie + 静态头（**无签名、无页面**），
+# 是零副作用的最小探活。cookie 从 Chromium 现取（CDP Network.getCookies），
+# 探活的 HTTP 往返**不占 CDP 锁** ⇒ 不干扰正在进行的对话。
+# 200 = 会话仍活；401 = 已过期（需重新登录）。
+KEEPALIVE_URL = "https://yuanbao.tencent.com/api/info/general"
+
+
+def _keepalive_probe_sync(cookie: str):
+    """同步探活（放线程池跑）。返回 (status, body)。"""
+    h = dict(STATIC_HEADERS)
+    h["Cookie"] = cookie
+    req = _ureq.Request(KEEPALIVE_URL, headers=h, method="GET")
+    try:
+        with _OPENER.open(req, timeout=30) as r:
+            return r.status, r.read().decode("utf-8", "ignore")[:200]
+    except _uerr.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "ignore")[:200]
+        except Exception:
+            return e.code, ""
+    except Exception as e:
+        return -1, ("%s: %s" % (type(e).__name__, e))[:200]
+
+
+async def _keepalive_once() -> dict:
+    """保活一次：取 cookie → 探活 → 更新 _KEEPALIVE。"""
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    try:
+        cookie = await asyncio.to_thread(m.extract_cookies)
+    except Exception as e:
+        r = {"ok": False, "status": None, "detail": "取 cookie 失败: %s" % str(e)[:160], "cookie_len": 0}
+        return r
+    if not cookie:
+        return {"ok": False, "status": None, "detail": "页面无 cookie（未登录？）", "cookie_len": 0}
+    # hy_user 是元宝登录态本体；没有它说明页面处于未登录/已重置状态
+    if "hy_user=" not in (cookie + ";"):
+        return {"ok": False, "status": None, "detail": "缺少 hy_user（未登录）", "cookie_len": len(cookie)}
+    st, body = await asyncio.to_thread(_keepalive_probe_sync, cookie)
+    return {"ok": st == 200, "status": st,
+            "detail": body if st != 200 else "alive", "cookie_len": len(cookie)}
+
+
+def _record_keepalive(r: dict) -> dict:
+    """把探活结果并入全局状态（含连续失败计数，供日志告警）。"""
+    _KEEPALIVE["count"] += 1
+    _KEEPALIVE["at"] = int(time.time())
+    _KEEPALIVE["ok"] = r.get("ok")
+    _KEEPALIVE["status"] = r.get("status")
+    _KEEPALIVE["detail"] = r.get("detail", "")
+    _KEEPALIVE["fail_streak"] = 0 if r.get("ok") else _KEEPALIVE.get("fail_streak", 0) + 1
+    return _KEEPALIVE
+
+
+async def _keepalive_loop():
+    """进程内定时保活。页面数据面必须单 worker，故这里只有一份循环（不会 N 份叠加）。"""
+    await asyncio.sleep(60)  # 启动后先等页面预热/首次使用
+    while True:
+        try:
+            r = await _keepalive_once()
+            snap = _record_keepalive(r)
+            lvl = "OK " if r.get("ok") else ("WARN" if snap["fail_streak"] < YB_KEEPALIVE_ALERT else "ERR ")
+            print("[keepalive] %s count=%d streak=%d status=%s %s"
+                  % (lvl, snap["count"], snap["fail_streak"], r.get("status"), r.get("detail", "")[:120]), flush=True)
+            # 新号登录后自动开启"无水印保存"（幂等：已是开启态则不写）
+            if YB_AUTO_WATERMARK and r.get("ok"):
+                await _watermark_auto()
+            # 号池生命周期：用健康观测驱动 自动隔离 / 自动恢复 / 超期剔除
+            if ACCOUNT is not None:
+                frozen, logged = False, True
+                try:
+                    import cdp_minter
+                    stt = await asyncio.to_thread(cdp_minter.get_minter().page_state)
+                    frozen = bool(stt.get("frozen"))
+                    logged = bool(stt.get("logged_in"))
+                except Exception:
+                    pass
+                ok_now, det = bool(r.get("ok")), r.get("detail", "")
+                if not logged:
+                    ok_now, det = False, det or "页面未登录"
+                a, act = ACCOUNT.record_health(ok_now, r.get("status"), det, frozen)
+                if act:
+                    print("[pool_state] auto %s → %s（%s）" % (act, a["state"], a["reason"]), flush=True)
+                elif a["state"] != "enabled":
+                    print("[pool_state] %s（%s，失败 %d 次）" % (a["state"], a["reason"], a["fail_streak"]),
+                          flush=True)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print("[keepalive] loop err: %s" % str(e)[:160], flush=True)
+        await asyncio.sleep(YB_KEEPALIVE_SEC)
+
+
+@app.on_event("startup")
+async def _start_metrics():
+    _init_metrics()
+    _init_account()
+
+
+@app.on_event("startup")
+async def _start_keepalive():
+    if YB_KEEPALIVE_SEC <= 0:
+        print("[keepalive] disabled (YB_KEEPALIVE_SEC=0)", flush=True)
+        return
+    if os.environ.get("YB_WORKERS", "1") not in ("", "1"):
+        print("[keepalive] skip: 多 worker 会重复保活（页面数据面本应单 worker）", flush=True)
+        return
+    print("[keepalive] enabled, every %ds" % YB_KEEPALIVE_SEC, flush=True)
+    asyncio.create_task(_keepalive_loop())
+
+
+# ---------------- 调用统计（账号 × 模型 × 端点） ----------------
+import contextvars as _ctxvars
+
+_MCTX = _ctxvars.ContextVar("yb_metrics_ctx", default=None)
+METRICS = None
+
+
+def _init_metrics():
+    """初始化统计器；/data/stats 不可写则退回代码目录下的 .stats（保证功能不因挂载缺失而消失）。"""
+    global METRICS
+    import metrics as _m
+    for d in (YB_STATS_DIR, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".stats")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w")
+            with open(probe, "a"):
+                pass
+            os.remove(probe)
+            METRICS = _m.Metrics(os.path.join(d, "events-%s.jsonl" % YB_INSTANCE_NAME_ENV),
+                                 YB_STATS_KEEP_DAYS)
+            print("[metrics] %s (keep %dd)" % (os.path.join(d, "events-%s.jsonl" % YB_INSTANCE_NAME_ENV),
+                                               YB_STATS_KEEP_DAYS), flush=True)
+            return
+        except Exception as e:
+            continue
+    print("[metrics] disabled: 无可写目录", flush=True)
+
+
+ACCOUNT = None
+
+
+def _init_account():
+    """号池账号状态机；/data/state 不可写则退回代码目录 .state。"""
+    global ACCOUNT
+    import pool_state
+    for d in (YB_STATE_DIR, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".state")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w")
+            with open(probe, "a"):
+                pass
+            os.remove(probe)
+            pth = os.path.join(d, "account-%s.json" % YB_INSTANCE_NAME_ENV)
+            ACCOUNT = pool_state.AccountState(pth, YB_INSTANCE_NAME_ENV,
+                                              YB_AUTO_DISABLE_AFTER, YB_AUTO_REENABLE_AFTER,
+                                              YB_AUTO_EJECT_AFTER_DAYS)
+            print("[pool_state] %s (auto-disable>=%d, re-enable>=%d, eject>%dd)"
+                  % (pth, YB_AUTO_DISABLE_AFTER, YB_AUTO_REENABLE_AFTER, YB_AUTO_EJECT_AFTER_DAYS),
+                  flush=True)
+            return
+        except Exception:
+            continue
+    print("[pool_state] disabled: 无可写目录", flush=True)
+
+
+def _key_tag(request: Request) -> str:
+    """给调用方打一个短指纹（绝不落库明文 key）。"""
+    v = _bearer_value(request) or (request.query_params.get("k") or "")
+    if not v:
+        return "anon"
+    import hashlib
+    if YUANBAO_API_KEY and v == YUANBAO_API_KEY:
+        return "instance-key"
+    return "k" + hashlib.sha256(v.encode()).hexdigest()[:8]
+
+
+def _mctx(**kw):
+    c = _MCTX.get()
+    if c is not None:
+        c.update(kw)
+
+
+@app.middleware("http")
+async def _metrics_mw(request: Request, call_next):
+    path = request.url.path
+    if METRICS is None or not path.startswith("/v1/"):
+        return await call_next(request)
+    t0 = time.time()
+    ctx = {"endpoint": path, "model": None, "stream": False, "usage": None, "err": None}
+    # 从请求体里取 model / stream（Starlette 会缓存 body，下游仍可正常读）
+    try:
+        if request.method == "POST" and "json" in (request.headers.get("content-type") or ""):
+            raw = await request.body()
+            if 0 < len(raw) < 200000:
+                b = json.loads(raw)
+                ctx["model"] = b.get("model")
+                ctx["stream"] = bool(b.get("stream"))
+    except Exception:
+        pass
+    tok = _MCTX.set(ctx)
+    status = 500
+    try:
+        resp = await call_next(request)
+        status = resp.status_code
+        return resp
+    except Exception as ex:
+        ctx["err"] = ("%s: %s" % (type(ex).__name__, ex))[:200]
+        raise
+    finally:
+        _MCTX.reset(tok)
+        try:
+            METRICS.record({
+                "ts": int(t0), "instance": YB_INSTANCE_NAME_ENV,
+                "endpoint": path, "model": ctx.get("model") or "?",
+                "status": status, "ok": 200 <= status < 300,
+                "ms": int((time.time() - t0) * 1000),
+                "stream": bool(ctx.get("stream")),
+                "usage": ctx.get("usage"), "err": ctx.get("err"),
+                "client": (request.client.host if request.client else ""),
+                "key": _key_tag(request),
+            })
+        except Exception:
+            pass
+
+
+# ---------------- 无水印保存（账号级开关，新号登录后自动开启） ----------------
+# 逆向自 `yb_v2_yb-component` chunk（其模块内常量 FIELD = "watermarkConfig"）：
+#   资质门禁: GET  /api/info/general          → graySwitches.grayKeyWithoutWatermark !== false
+#   读配置  : POST /api/userinfo/getuserconfig {scene:1, configFields:["watermarkConfig"]}
+#   写配置  : POST /api/updateuserinfo         {updateFields:["watermarkConfig"],
+#                                               userConfig:{watermarkConfig:{...读到的值, ...patch}}}
+#   开启    = patch {saveWithoutWatermark:true, hasPopupAgreement:true}
+#   （前端 d(n)=u({saveWithoutWatermark:n, ...(n?{hasPopupAgreement:true}:{})})）
+# 关键：这两个接口 **不需要签名**（cookie + 静态头即可）⇒ 可完全脱离页面调用，零浏览器开销。
+WM_FIELD = "watermarkConfig"
+WM_HOST = "https://yuanbao.tencent.com"
+
+
+def _wm_call(cookie: str, path: str, payload=None, method: str = "POST", cap: int = 200000):
+    h = {**STATIC_HEADERS, **(_DYN_HEADERS or {})}
+    h["Cookie"] = cookie
+    h["content-type"] = "application/json"
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = _ureq.Request(WM_HOST + path, data=data, headers=h, method=method)
+    try:
+        with _OPENER.open(req, timeout=30) as r:
+            # 🔴 不要截断得太狠：/api/info/general 的 graySwitches 很长，
+            # 截到几百字符会 JSON 解析失败（曾导致 gray_ok 恒为 null）
+            return r.status, r.read().decode("utf-8", "ignore")[:cap]
+    except _uerr.HTTPError as e:
+        try:
+            return e.code, e.read().decode("utf-8", "ignore")[:cap]
+        except Exception:
+            return e.code, ""
+    except Exception as e:
+        return -1, ("%s: %s" % (type(e).__name__, e))[:200]
+
+
+def _wm_read(cookie: str):
+    st, body = _wm_call(cookie, "/api/userinfo/getuserconfig",
+                        {"scene": 1, "configFields": [WM_FIELD]})
+    try:
+        cfg = (json.loads(body).get("userConfig") or {}).get(WM_FIELD) or {}
+        return st, cfg
+    except Exception:
+        return st, {"__raw": body[:200]}
+
+
+def _wm_gray_ok(cookie: str):
+    """灰度门禁：grayKeyWithoutWatermark !== false 才有资格。"""
+    st, body = _wm_call(cookie, "/api/info/general", None, "GET", cap=2_000_000)
+    if st != 200:
+        return None
+    try:
+        g = (json.loads(body).get("graySwitches") or {}).get("grayKeyWithoutWatermark")
+        return g is not False
+    except Exception:
+        return None
+
+
+async def _watermark_ensure(target: bool = True, force: bool = False) -> dict:
+    """确保账号「无水印保存」处于目标状态；已是目标状态则不写入（幂等）。"""
+    import cdp_minter
+    try:
+        cookie = await asyncio.to_thread(cdp_minter.get_minter().extract_cookies)
+    except Exception as e:
+        return {"ok": False, "enabled": None, "detail": "取 cookie 失败: %s" % str(e)[:120]}
+    if not cookie or "hy_user=" not in (cookie + ";"):
+        return {"ok": False, "enabled": None, "detail": "未登录（无 hy_user）"}
+    st, cur = await asyncio.to_thread(_wm_read, cookie)
+    if st != 200:
+        return {"ok": False, "enabled": None, "detail": "读取失败 HTTP %s %s" % (st, cur.get("__raw", ""))}
+    if cur.get("saveWithoutWatermark") is target and not force:
+        return {"ok": True, "enabled": target, "detail": "已是目标状态（未写）", "config": cur}
+    patch = {"saveWithoutWatermark": True, "hasPopupAgreement": True} if target else {"saveWithoutWatermark": False}
+    cur2 = {k: v for k, v in cur.items() if not str(k).startswith("__")}
+    st2, body = await asyncio.to_thread(
+        _wm_call, cookie, "/api/updateuserinfo",
+        {"updateFields": [WM_FIELD], "userConfig": {WM_FIELD: {**cur2, **patch}}})
+    if st2 != 200:
+        return {"ok": False, "enabled": cur.get("saveWithoutWatermark"), "detail": "写入失败 HTTP %s %s" % (st2, body)}
+    _, after = await asyncio.to_thread(_wm_read, cookie)
+    ok = after.get("saveWithoutWatermark") is target
+    return {"ok": ok, "enabled": after.get("saveWithoutWatermark"),
+            "detail": "已写入并复核" if ok else "写入后复核未生效", "before": cur2, "after": after}
+
+
+def _record_watermark(r: dict) -> dict:
+    _WATERMARK.update({"at": int(time.time()), "ok": r.get("ok"),
+                       "enabled": r.get("enabled"), "detail": r.get("detail", "")})
+    _WATERMARK["attempts"] = _WATERMARK.get("attempts", 0) + 1
+    return _WATERMARK
+
+
+async def _watermark_auto():
+    """后台自动补开（新号登录后立即生效）。加运行锁避免并发重复写。"""
+    global _WM_RUNNING
+    if _WM_RUNNING:
+        return None
+    _WM_RUNNING = True
+    try:
+        r = await _watermark_ensure(True)
+        _record_watermark(r)
+        print("[watermark] auto ok=%s enabled=%s %s"
+              % (r.get("ok"), r.get("enabled"), r.get("detail", "")[:100]), flush=True)
+        return r
+    finally:
+        _WM_RUNNING = False
+
 
 
 def _yb_headers(cookie: str, sig: Optional[dict], agent_id: str, conv: str = "", extra: Optional[dict] = None) -> dict:
@@ -517,12 +890,18 @@ def _dynamic_fp(tab: str) -> dict:
 
 
 def _pev(js: str, timeout: int = 300):
-    """页内执行（执行器无关）：cdp 后端走 headless Chromium 的 CDP，bsk 后端走浏览器桥。"""
+    """页内执行（执行器无关）：cdp 后端走 headless Chromium 的 CDP，bsk 后端走浏览器桥。
+
+    🔴 页内 JS（JS_CHAT / JS_IMAGE / JS_UPLOAD_REF）会读全局 `__ybStaticHeaders`，
+    而该全局在 **页面重建 / reset_login / 容器重启** 后都会丢 —— 原实现只定义了
+    JS_INJECT_STATIC 却从没调用过，导致页面数据面一跑就 `ReferenceError: __ybStaticHeaders is not defined`。
+    这里把注入与调用拼进**同一次** Runtime.evaluate（不增加往返），保证每次执行前都就绪。
+    """
     if YB_MINT_BACKEND == "cdp":
         import cdp_minter
-        return cdp_minter.get_minter().evaluate(js, timeout_s=timeout)
+        return cdp_minter.get_minter().evaluate(JS_INJECT_STATIC + ";\n" + js, timeout_s=timeout)
     ctx = _ensure_page()
-    return _ev(js, tab_id=ctx["tabId"], timeout=timeout)
+    return _ev(JS_INJECT_STATIC + ";\n" + js, tab_id=ctx["tabId"], timeout=timeout)
 
 
 _MINTER = None
@@ -1177,20 +1556,12 @@ def _flatten_messages(messages: list) -> str:
 
 # ---------------- OpenAI 端点 ----------------
 def _screenshot_png(m):
-    """CDP 截图（返回图片响应）。"""
-    import base64 as _b64
-    with m._lock:
-        ws = m._page_ws
-        if ws is None:
-            ws = m._ensure_page()
-        ws.settimeout(30)
-        ws.send(json.dumps({"id": 40, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
-        deadline = time.time() + 25
-        while time.time() < deadline:
-            msg = json.loads(ws.recv())
-            if msg.get("id") == 40:
-                return Response(content=_b64.b64decode(msg["result"]["data"]), media_type="image/png")
-    return JSONResponse({"error": "截图超时"}, status_code=504)
+    """CDP 截图（返回图片响应）。保留兼容：统一走 m.screenshot（内部持锁，原子会话）。"""
+    try:
+        png = m.screenshot(None)
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+    return Response(content=png, media_type="image/png")
 
 
 @app.get("/login")
@@ -1203,20 +1574,18 @@ async def login_page(req: Request):
     if YB_MINT_BACKEND != "cdp":
         return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
     try:
-        import base64
         import cdp_minter
         m = cdp_minter.get_minter()
         tab = (req.query_params.get("tab") or "").strip().lower()
-        # 注意：evaluate 内部自带锁，禁止在外层再抢（跨线程/同线程双重加锁均死锁）
-        m._ensure_page()
-        if tab in ("wechat", "phone"):
-            names = "['微信','WeChat']" if tab == "wechat" else "['手机','Phone']"
-            m.evaluate("(() => { const b=[...document.querySelectorAll('*')].filter(e=>e.offsetWidth>0&&e.children.length<=2&&['登录','Log In'].includes((e.textContent||'').trim())).sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0]; if(b && !document.querySelector('.hyc-login-v2,.hyc-phone-login')) b.click(); return 'ok'; })()", timeout_s=30)
-            m.evaluate(f"(() => {{ const c=[...document.querySelectorAll('*')].filter(e=>e.offsetWidth>0&&e.children.length<=2&&{names}.includes((e.textContent||'').trim())).sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0]; if(c) c.click(); return 'ok'; }})()", timeout_s=30)
-            import time as _t
-            _t.sleep(2)
-        return await asyncio.to_thread(_screenshot_png, m)
+        # 🔴 必须整体交给 m.screenshot（内部一次性持锁，切页+截图是一个原子 CDP 会话）：
+        # 旧写法把 ensure_page/两次 evaluate/截图拆成 4 段、跨"事件循环线程 + to_thread 线程"，
+        # 同一 ws 上交错收包会互相偷回包（探针 id=1 vs evaluate id=20）⇒ /login 永久 hang。
+        png = await asyncio.to_thread(
+            m.screenshot, tab if tab in ("wechat", "phone") else None)
+        return Response(content=png, media_type="image/png")
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # 502 必须留痕（否则 docker logs 里只有一行 502，无从排查）
         return JSONResponse({"error": str(e)[:200]}, status_code=502)
 
 
@@ -1369,6 +1738,465 @@ async def login_phone_verify(req: Request):
         return JSONResponse({"error": str(e)[:200]}, status_code=502)
 
 
+@app.get("/admin/state")
+async def admin_state(req: Request):
+    """容器页面状态：已登录 / 已被冻结（冻结时页面上没有"登录"按钮，必须先重置登录态）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    st = await asyncio.to_thread(m.page_state)
+    # 登录态出现后 ~一个轮询周期内自动补开"无水印保存"（新号扫码后即生效）
+    if (YB_AUTO_WATERMARK and st.get("logged_in") and not st.get("frozen")
+            and not _WM_RUNNING and time.time() - _WATERMARK.get("at", 0) > 60):
+        asyncio.create_task(_watermark_auto())
+    return {"result": st, "keepalive": _KEEPALIVE, "watermark": _WATERMARK}
+
+
+@app.api_route("/admin/keepalive", methods=["GET", "POST"])
+async def admin_keepalive(req: Request):
+    """主动保活/探活一次（也可由外部 cron 定时打这个端点，代替进程内定时任务）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    r = await _keepalive_once()
+    return {"result": r, "last": _record_keepalive(r)}
+
+
+@app.api_route("/admin/watermark", methods=["GET", "POST"])
+async def admin_watermark(req: Request):
+    """账号级「无水印保存」开关（下载图片/视频不带水印）。
+
+    GET                     → 查看当前配置 + 灰度资质
+    POST {"enabled": true}  → 开启（等价 UI 里的"无水印保存"开关）
+    POST {"enabled": false} → 关闭
+    POST {"force": true}    → 已是目标状态也重写一次
+    新号登录后由保活循环 + /admin/state 自动补开（YB_AUTO_WATERMARK=1，默认开）。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    import cdp_minter
+    if req.method == "GET":
+        try:
+            cookie = await asyncio.to_thread(cdp_minter.get_minter().extract_cookies)
+        except Exception as e:
+            return JSONResponse({"error": str(e)[:160]}, status_code=502)
+        st, cfg = await asyncio.to_thread(_wm_read, cookie)
+        gray = await asyncio.to_thread(_wm_gray_ok, cookie)
+        return {"result": {"http": st, "config": cfg, "gray_ok": gray,
+                           "enabled": cfg.get("saveWithoutWatermark")},
+                "last": _WATERMARK}
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    target = bool(body.get("enabled", True))
+    r = await _watermark_ensure(target, force=bool(body.get("force")))
+    return {"result": r, "last": _record_watermark(r)}
+
+
+@app.get("/admin/pool")
+async def admin_pool(req: Request):
+    """号池总览（**服务端聚合**）：本实例 + 各 peer 的页面状态 / 保活状态。
+
+    走服务端代查而不是浏览器跨域 fetch —— 后者会被 CORS 拦掉，且 peer 的 key 不该下发到前端。
+    peer 鉴权用 YB_FLEET_KEY（各实例共享的只读 key）。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    import cdp_minter
+    me_state = {}
+    try:
+        me_state = await asyncio.to_thread(cdp_minter.get_minter().page_state)
+    except Exception as e:
+        me_state = {"error": str(e)[:120]}
+    me = {"name": YB_INSTANCE_NAME_ENV, "url": YB_BASE_URL_ENV, "self": True,
+          "ok": True, "state": me_state, "keepalive": _KEEPALIVE}
+
+    def _fetch(p):
+        import requests
+        url = p["url"].rstrip("/") + "/admin/state"
+        hdr = {"Authorization": "Bearer " + (YB_FLEET_KEY or YUANBAO_API_KEY)}
+        try:
+            r = requests.get(url, headers=hdr, timeout=20)
+            if r.status_code == 401:
+                return {**p, "ok": False, "error": "鉴权失败（peer 需设置相同的 YB_FLEET_KEY）"}
+            j = r.json()
+            return {**p, "ok": r.ok, "state": j.get("result"), "keepalive": j.get("keepalive")}
+        except Exception as e:
+            return {**p, "ok": False, "error": str(e)[:140]}
+
+    peers = [pp for pp in _pool_peers() if pp["url"].rstrip("/") != YB_BASE_URL_ENV]
+    results = await asyncio.gather(*[asyncio.to_thread(_fetch, p) for p in peers]) if peers else []
+    return {"self": me, "peers": list(results), "fleet_key_set": bool(YB_FLEET_KEY)}
+
+
+# ---------------- 统计 & 号池批量运维 ----------------
+def _fleet_peers_all():
+    """所有实例（含自己），self 标记自身 —— 批量操作与汇总统计的目标集合。"""
+    out = [{**pp, "self": pp["url"].rstrip("/") == YB_BASE_URL_ENV} for pp in _pool_peers()]
+    if YB_BASE_URL_ENV and not any(x["self"] for x in out):
+        out.insert(0, {"id": "self", "name": YB_INSTANCE_NAME_ENV, "url": YB_BASE_URL_ENV, "self": True})
+    return out
+
+
+def _fleet_http(url: str, path: str, method: str = "GET", payload=None, timeout: int = 60):
+    """服务端代调某个实例（用 YB_FLEET_KEY）。"""
+    import requests
+    hdr = {"Authorization": "Bearer " + (YB_FLEET_KEY or YUANBAO_API_KEY)}
+    try:
+        u = url.rstrip("/") + path
+        r = (requests.post(u, headers=hdr, json=payload or {}, timeout=timeout)
+             if method == "POST" else requests.get(u, headers=hdr, timeout=timeout))
+        if r.status_code == 401:
+            return {"ok": False, "error": "鉴权失败（peer 需配置相同 YB_FLEET_KEY）"}
+        return {"ok": r.ok, "data": (r.json() if r.content else None), "status": r.status_code}
+    except Exception as e:
+        return {"ok": False, "error": str(e)[:140]}
+
+
+@app.get("/admin/stats")
+async def admin_stats(req: Request, days: int = 7):
+    """本实例调用统计：账号 × 模型 × 端点 × 状态 + 按天走势。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if METRICS is None:
+        return JSONResponse({"error": "统计未启用（YB_STATS_DIR 不可写）"}, status_code=503)
+    return {"result": METRICS.summary(days), "instance": YB_INSTANCE_NAME_ENV}
+
+
+@app.get("/admin/stats/detail")
+async def admin_stats_detail(req: Request, limit: int = 100, model: str = "",
+                             ok: str = "", endpoint: str = "", instance: str = ""):
+    """明细日志（最近优先，可按模型/结果/端点过滤）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if METRICS is None:
+        return JSONResponse({"error": "统计未启用"}, status_code=503)
+    rows = METRICS.detail(limit, model or None, ok or None, endpoint or None, instance or None)
+    return {"result": rows, "count": len(rows), "instance": YB_INSTANCE_NAME_ENV}
+
+
+@app.get("/admin/stats/export")
+async def admin_stats_export(req: Request):
+    """导出原始 JSONL（一行一次调用，可直接喂分析工具）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if METRICS is None:
+        return JSONResponse({"error": "统计未启用"}, status_code=503)
+    name = os.path.basename(METRICS.path)
+    data = b""
+    if os.path.exists(METRICS.path):
+        with open(METRICS.path, "rb") as f:
+            data = f.read()
+    return Response(content=data, media_type="application/x-ndjson",
+                    headers={"Content-Disposition": 'attachment; filename="%s"' % name})
+
+
+@app.post("/admin/stats/prune")
+async def admin_stats_prune(req: Request):
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if METRICS is None:
+        return JSONResponse({"error": "统计未启用"}, status_code=503)
+    return {"result": METRICS.prune()}
+
+
+@app.get("/admin/fleet/stats")
+async def admin_fleet_stats(req: Request, days: int = 7):
+    """号池汇总统计：合并各实例 summary ⇒ **账号 × 模型**矩阵。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    targets = _fleet_peers_all()
+
+    async def one(t):
+        if t.get("self"):
+            return {**t, "ok": METRICS is not None,
+                    "data": {"result": METRICS.summary(days)} if METRICS else None}
+        r = await asyncio.to_thread(_fleet_http, t["url"], "/admin/stats?days=%d" % days)
+        return {**t, **r}
+
+    res = await asyncio.gather(*[one(t) for t in targets]) if targets else []
+    merged, per_acc = {}, []
+    for t in res:
+        d = ((t.get("data") or {}).get("result")) or {}
+        w = d.get("window") or {}
+        per_acc.append({
+            "name": t.get("name") or t.get("url"), "url": t.get("url"),
+            "self": bool(t.get("self")), "ok": bool(t.get("ok")), "error": t.get("error"),
+            "total": w.get("total", 0), "ok_n": w.get("ok", 0), "err_n": w.get("err", 0),
+            "all_time": (d.get("all_time") or {}).get("total", 0),
+            "models": {m["model"]: m["n"] for m in (d.get("by_model") or [])},
+        })
+        for m in (d.get("by_model") or []):
+            e = merged.setdefault(m["model"], {"model": m["model"], "n": 0, "ok": 0, "err": 0})
+            e["n"] += m["n"]; e["ok"] += m.get("ok", 0); e["err"] += m.get("err", 0)
+    return {"accounts": per_acc, "by_model": sorted(merged.values(), key=lambda x: -x["n"]),
+            "fleet_key_set": bool(YB_FLEET_KEY), "window_days": days}
+
+
+@app.post("/admin/fleet/{op}")
+async def admin_fleet_op(req: Request, op: str):
+    """批量运维扇出。op ∈ keepalive（批量保活）| watermark（批量无水印）| state（批量状态）。
+    body: {"enabled": true|false} 供 watermark 使用。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    spec = {"keepalive": ("/admin/keepalive", "POST"),
+            "watermark": ("/admin/watermark", "POST"),
+            "state": ("/admin/state", "GET")}.get(op)
+    if not spec:
+        return JSONResponse({"error": "未知操作：%s（支持 keepalive|watermark|state）" % op}, status_code=400)
+    path, method = spec
+    targets = _fleet_peers_all()
+
+    async def one(t):
+        if t.get("self"):
+            try:
+                if op == "keepalive":
+                    r = await _keepalive_once(); _record_keepalive(r)
+                    return {**t, "ok": bool(r.get("ok")), "data": {"result": r}}
+                if op == "watermark":
+                    r = await _watermark_ensure(bool(body.get("enabled", True)))
+                    _record_watermark(r)
+                    return {**t, "ok": bool(r.get("ok")), "data": {"result": r}}
+                import cdp_minter
+                st = await asyncio.to_thread(cdp_minter.get_minter().page_state)
+                return {**t, "ok": True, "data": {"result": st}}
+            except Exception as e:
+                return {**t, "ok": False, "error": str(e)[:140]}
+        r = await asyncio.to_thread(_fleet_http, t["url"], path, method, body)
+        return {**t, **r}
+
+    res = await asyncio.gather(*[one(t) for t in targets]) if targets else []
+    ok_n = sum(1 for x in res if x.get("ok"))
+    return {"op": op, "total": len(res), "ok": ok_n, "failed": len(res) - ok_n, "results": res}
+
+
+# ---------------- 号池生命周期：状态 / 管理 / 轮询路由 ----------------
+_PEER_STATE_CACHE: dict = {}          # url -> (ts, state_dict)
+_ROT_IDX = 0
+_ROT_LOCK = threading.Lock()
+
+
+def _peer_state_cached(url: str, ttl: int = 30):
+    now = time.time()
+    hit = _PEER_STATE_CACHE.get(url)
+    if hit and now - hit[0] < ttl:
+        return hit[1]
+    r = _fleet_http(url, "/admin/account")
+    st = ((r.get("data") or {}).get("result")) if r.get("ok") else None
+    _PEER_STATE_CACHE[url] = (now, st)
+    return st
+
+
+def _router_targets():
+    """可参与轮询的实例：自己 + 各 peer 中 state=enabled 且最近健康非 False。"""
+    out = []
+    for t in _fleet_peers_all():
+        if t.get("self"):
+            st = ACCOUNT.get() if ACCOUNT else {"state": "enabled", "routable": True, "last_health": None}
+            h = st.get("last_health") or {}
+            if st.get("routable") and h.get("ok") is not False:
+                out.append({**t, "state": st, "key": YUANBAO_API_KEY})
+        else:
+            st = _peer_state_cached(t["url"])
+            if st and st.get("routable"):
+                out.append({**t, "state": st})
+    return out
+
+
+def _router_pick():
+    global _ROT_IDX
+    ts = _router_targets()
+    if not ts:
+        return None
+    with _ROT_LOCK:
+        t = ts[_ROT_IDX % len(ts)]
+        _ROT_IDX += 1
+    return t
+
+
+@app.get("/admin/account")
+async def admin_account(req: Request):
+    """本实例账号的状态机快照（启用/禁用/隔离/剔除 + 健康 + 变更历史）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if ACCOUNT is None:
+        return {"result": {"state": "unknown", "label": "未启用", "routable": True},
+                "instance": YB_INSTANCE_NAME_ENV}
+    return {"result": ACCOUNT.get(), "instance": YB_INSTANCE_NAME_ENV}
+
+
+@app.post("/admin/account")
+async def admin_account_op(req: Request):
+    """账号生命周期操作。body: {action, reason, name?}
+    action ∈ enable|disable|eject|restore|reset|note；带 name 则转发给对应实例执行。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    action = (body.get("action") or "").strip()
+    reason = (body.get("reason") or "").strip()
+    target = (body.get("name") or "").strip()
+    if target and target != YB_INSTANCE_NAME_ENV:
+        t = next((x for x in _fleet_peers_all() if x.get("name") == target), None)
+        if not t:
+            return JSONResponse({"error": "未知实例：%s" % target}, status_code=404)
+        r = await asyncio.to_thread(_fleet_http, t["url"], "/admin/account", "POST",
+                                    {"action": action, "reason": reason}, 30)
+        _PEER_STATE_CACHE.pop(t["url"], None)
+        return {"result": (r.get("data") or {}).get("result") if r.get("ok") else None,
+                "via": "fleet", "target": target, "upstream": r}
+    if ACCOUNT is None:
+        return JSONResponse({"error": "状态机未启用（YB_STATE_DIR 不可写）"}, status_code=503)
+    out = ACCOUNT.apply(action, reason, by="manual")
+    print("[pool_state] manual %s by=%s → %s（%s）"
+          % (action, "api", out.get("state", {}).get("state"), reason) if out.get("ok") else "", flush=True)
+    return {"result": out, "instance": YB_INSTANCE_NAME_ENV}
+
+
+@app.get("/admin/accounts")
+async def admin_accounts(req: Request):
+    """整个号池的账号清单：状态 + 健康 + 近 24h 调用量（管理页数据源）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    targets = _fleet_peers_all()
+
+    async def one(t):
+        if t.get("self"):
+            st = ACCOUNT.get() if ACCOUNT else {"state": "unknown", "routable": True}
+            stat = METRICS.summary(1) if METRICS else {}
+            return {**t, "ok": True, "state": st, "stats": (stat.get("window") or {})}
+        r = await asyncio.to_thread(_fleet_http, t["url"], "/admin/account", "GET", None, 20)
+        s2 = await asyncio.to_thread(_fleet_http, t["url"], "/admin/stats?days=1", "GET", None, 20)
+        return {**t, "ok": bool(r.get("ok")),
+                "state": ((r.get("data") or {}).get("result")),
+                "stats": (((s2.get("data") or {}).get("result") or {}).get("window") or {}),
+                "error": r.get("error")}
+
+    res = await asyncio.gather(*[one(t) for t in targets]) if targets else []
+    routable = [x for x in res if (x.get("state") or {}).get("routable")]
+    return {"accounts": res, "routable": len(routable), "total": len(res),
+            "router_enabled": YB_ROUTER, "router_entry": "/pool/v1",
+            "auto": {"disable_after": YB_AUTO_DISABLE_AFTER,
+                     "reenable_after": YB_AUTO_REENABLE_AFTER,
+                     "eject_after_days": YB_AUTO_EJECT_AFTER_DAYS},
+            "rotation_index": _ROT_IDX}
+
+
+@app.api_route("/pool/v1/{rest:path}", methods=["GET", "POST"])
+async def pool_router(req: Request, rest: str):
+    """**轮询入口**：/pool/v1/<rest> 轮询分发到各可用账号，失败自动切下一个。
+
+    与直连入口的分工：
+      /v1/*       → 只用本实例自己的账号（直连，行为不变）
+      /pool/v1/*  → 在整个号池里轮询（本接口；调用方只认一个 key）
+    仅 state=enabled 的账号参与；遇到 5xx/连接错误自动 failover 到下一个。
+    """
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if not YB_ROUTER:
+        return JSONResponse({"error": "轮询入口未启用（YB_ROUTER=0）"}, status_code=404)
+    import requests
+    raw = await req.body()
+    tried, last_err = [], None
+    cand = _router_targets()
+    if not cand:
+        return JSONResponse({"error": {"message": "号池内没有可用账号（全部被禁用/隔离/剔除）",
+                                       "type": "api_error"}}, status_code=503)
+    for _ in range(min(3, len(cand))):
+        t = _router_pick()
+        if not t:
+            break
+        tried.append(t.get("name"))
+        url = t["url"].rstrip("/") + "/v1/" + rest
+        hdr = {"content-type": req.headers.get("content-type", "application/json")}
+        tkey = t.get("key") or ""
+        if tkey:
+            hdr["Authorization"] = "Bearer " + tkey
+        try:
+            up = await asyncio.to_thread(
+                lambda: requests.request(req.method, url, data=raw, headers=hdr,
+                                         stream=True, timeout=(15, 600)))
+        except Exception as e:
+            last_err = "%s: %s" % (type(e).__name__, str(e)[:120])
+            continue
+        if up.status_code >= 500:
+            last_err = "上游 %s 返回 %d" % (t.get("name"), up.status_code)
+            try:
+                up.close()
+            except Exception:
+                pass
+            continue
+
+        def gen(resp=up):
+            try:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        yield chunk
+            finally:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+
+        # 同步生成器：Starlette 会自动放到线程池迭代，不会阻塞事件循环
+        return StreamingResponse(gen(), status_code=up.status_code,
+                                 media_type=up.headers.get("content-type", "application/json"),
+                                 headers={"X-YB-Routed-To": str(t.get("name"))})
+    return JSONResponse({"error": {"message": "号池轮询全部失败：%s（已尝试 %s）" % (last_err, tried),
+                                   "type": "api_error"}}, status_code=503)
+
+
+@app.post("/login/reset")
+async def login_reset(req: Request):
+    """重置登录态：清 cookie + localStorage（保留设备种子）后重载页面 —— 换账号登录前必做。"""
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    try:
+        r = await asyncio.to_thread(m.reset_login)
+        # 换号后必须重新判定无水印状态（旧号的结论不适用于新号）
+        _WATERMARK.update({"at": 0, "ok": None, "enabled": None,
+                           "detail": "登录态已重置，待新号登录后自动补开", "attempts": 0})
+        return {"result": r, "hint": "已回到未登录态；新号登录后会自动开启无水印保存"}
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+
+
 import json
 import os
 
@@ -1377,53 +2205,214 @@ QR_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>元宝扫码登录</title>
+<title>元宝登录</title>
 <style>
   :root { --bg:#faf9f7; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; }
+  * { box-sizing:border-box; }
   body { margin:0; padding:20px; background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC",sans-serif; text-align:center; }
   h1 { font-size:16px; font-weight:500; margin:0 0 12px; }
   .wrap { max-width:520px; margin:0 auto; background:#fff; border:1px solid var(--line); border-radius:12px; padding:14px; }
   img { width:100%; border-radius:8px; display:block; }
-  input { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font:13px inherit; margin-bottom:10px; }
+  input, select { width:100%; padding:9px 11px; border:1px solid var(--line); border-radius:8px; font:13px inherit; background:#fff; color:var(--text); }
   .row { display:flex; gap:8px; align-items:center; margin-top:10px; }
   button { flex:1; padding:9px 12px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:8px; font:13px inherit; cursor:pointer; }
   button.ghost { background:#fff; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .tabs { display:flex; gap:6px; margin:2px 0 12px; }
+  .tab { flex:1; padding:8px 10px; border:1px solid var(--line); background:#fff; color:var(--muted); border-radius:8px; font:13px inherit; cursor:pointer; }
+  .tab.on { border-color:var(--accent); color:var(--accent); font-weight:500; background:#f3f1fc; }
   .muted { color:var(--muted); font-size:12px; margin-top:8px; }
   .status { margin-top:8px; font-size:12px; }
-  .ok { color:#3B6D11; } .err { color:#A32D2D; }
+  .ok { color:#3B6D11; } .err { color:#A32D2D; } .warn { color:#854F0B; }
+  .warnbar { background:#fdf3e3; border:1px solid #e8cfa0; color:#854F0B; border-radius:8px;
+             padding:8px 10px; font-size:12px; margin-bottom:10px; text-align:left; }
+  .okbar { background:#eef7e9; border:1px solid #b8d9a4; color:#3B6D11; border-radius:8px;
+           padding:8px 10px; font-size:12px; margin-bottom:10px; text-align:left; }
 </style>
 </head>
 <body>
-<h1>元宝扫码登录（自动刷新）</h1>
+<h1>元宝登录（登录态持久化到容器）</h1>
 <div class="wrap">
   <input id="key" type="password" placeholder="门禁 Key（浏览器本地保存）">
-  <img id="qr" alt="登录二维码">
+  <div class="muted" id="kinfo" style="margin:-4px 0 10px"></div>
+  <div id="warn" style="display:none"></div>
+
+  <div class="tabs">
+    <button class="tab on" id="tWx" onclick="setTab('wechat')">微信扫码</button>
+    <button class="tab"    id="tPh" onclick="setTab('phone')">手机号登录</button>
+  </div>
+
+  <div id="paneWx">
+    <img id="qr" alt="登录二维码">
+  </div>
+
+  <div id="panePh" style="display:none">
+    <div class="row" style="margin-top:0">
+      <select id="area" style="max-width:150px">
+        <option value="+852">+852 中国香港</option>
+        <option value="+86">+86 中国大陆</option>
+      </select>
+      <input id="phone" placeholder="手机号（不含区号）" style="flex:1">
+    </div>
+    <button id="sendBtn" onclick="sendCode()" style="margin-top:10px">发送验证码</button>
+    <div class="row">
+      <input id="code" placeholder="6 位验证码" style="flex:1">
+      <button onclick="verifyCode()">提交登录</button>
+    </div>
+    <div class="status" id="phSt">未发送</div>
+    <img id="shot" alt="手机号登录页面截图" style="margin-top:12px">
+    <div class="muted">⚠️ 接码平台的虚拟号段大概率被风控直接拒（AQ1001）；自有真实号更可靠。微信扫码不过短信风控。</div>
+  </div>
+
   <div class="row">
-    <button onclick="saveKey()">保存 Key</button>
     <button class="ghost" onclick="refresh(true)">立即刷新</button>
+    <button class="ghost" onclick="saveKey()">保存 Key</button>
+  </div>
+  <div class="row">
+    <button class="ghost" onclick="resetLogin()">重置登录态（清 cookie · 换账号用）</button>
   </div>
   <div class="status" id="st">等待 Key…</div>
-  <div class="muted">用微信扫码完成登录 · 登录态自动持久化到容器 · 已登录后此页显示当前页面</div>
+  <div class="muted" id="tip">用微信扫码完成登录 · 自动刷新 · 已登录后此处显示当前页面</div>
 </div>
 <script>
-let KEY = localStorage.getItem('yb_key') || '';
-document.getElementById('key').value = KEY;
-const st = document.getElementById('st');
-function saveKey(){ KEY = document.getElementById('key').value.trim(); localStorage.setItem('yb_key', KEY); refresh(true); }
-async function refresh(force){
-  if (!KEY) { st.textContent='请先填写门禁 Key'; st.className='status err'; return; }
-  try {
-    const r = await fetch('/login?tab=wechat&t=' + Date.now(), { headers: { 'Authorization': 'Bearer ' + KEY } });
-    if (r.status === 401) { st.textContent='Key 无效（401）'; st.className='status err'; return; }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    document.getElementById('qr').src = URL.createObjectURL(await r.blob());
-    const t = new Date().toLocaleTimeString();
-    st.textContent = '已刷新 ' + t + ' · 每 20 秒自动刷新';
+const _qk = (new URLSearchParams(location.search).get('k') || '').trim();
+let KEY = '';
+try { KEY = _qk || (localStorage.getItem('yb_key') || '').trim(); if (_qk) localStorage.setItem('yb_key', _qk); } catch (e) { KEY = _qk || ''; }
+let TAB = (new URLSearchParams(location.search).get('tab') === 'phone') ? 'phone' : 'wechat';
+const $ = (id) => document.getElementById(id);
+const st = $('st'), phSt = $('phSt');
+$('key').value = KEY;
+(function () {
+  const e = $('kinfo'); if (!e) return;
+  e.textContent = KEY ? ('当前 Key：' + KEY.slice(0, 12) + '…' + KEY.slice(-4) + '（长度 ' + KEY.length + '）')
+                      : '未载入 Key —— 请用带 ?k= 的完整链接打开本页';
+})();
+
+function setTab(t) {
+  TAB = t;
+  $('tWx').className = 'tab' + (t === 'wechat' ? ' on' : '');
+  $('tPh').className = 'tab' + (t === 'phone' ? ' on' : '');
+  $('paneWx').style.display = (t === 'wechat') ? '' : 'none';
+  $('panePh').style.display = (t === 'phone') ? '' : 'none';
+  $('tip').textContent = (t === 'wechat')
+    ? '用微信扫码完成登录 · 自动刷新 · 已登录后此处显示当前页面'
+    : '切换容器页面到手机号登录 · 填号 → 发送 → 填验证码 → 提交';
+  refresh(true);
+}
+
+function bindImg(im, label) {
+  im.onload = () => {
+    st.textContent = label + '已刷新 ' + new Date().toLocaleTimeString()
+                     + (TAB === 'wechat' ? ' · 每 20 秒自动刷新' : '');
     st.className = 'status ok';
+  };
+  im.onerror = () => {
+    st.textContent = label + '截图加载失败：Key 可能不完整（长度 43）· 请用带 ?k= 的完整链接打开';
+    st.className = 'status err';
+  };
+}
+
+function refresh(force) {
+  if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
+  const k = encodeURIComponent(KEY);
+  if (TAB === 'wechat') {
+    const im = $('qr'); bindImg(im, ''); im.src = '/login?tab=wechat&k=' + k + '&t=' + Date.now();
+  } else {
+    const im = $('shot'); bindImg(im, '登录页'); im.src = '/login?tab=phone&k=' + k + '&t=' + Date.now();
+  }
+}
+
+function saveKey() {
+  KEY = $('key').value.trim();
+  try { localStorage.setItem('yb_key', KEY); } catch (e) {}
+  refresh(true);
+}
+
+async function sendCode() {
+  if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
+  const phone = $('phone').value.trim(), area = $('area').value;
+  if (!phone) { phSt.textContent = '请填手机号'; phSt.className = 'status warn'; return; }
+  $('sendBtn').disabled = true;
+  phSt.textContent = '发送中…'; phSt.className = 'status';
+  try {
+    const r = await fetch('/login/phone/send', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + KEY, 'content-type': 'application/json' },
+      body: JSON.stringify({ phone: phone, area: area })
+    });
+    const d = await r.json();
+    const res = d.result || {};
+    if (res.toast) {
+      const bad = String(res.toast).toLowerCase().indexOf('valid') >= 0;
+      phSt.textContent = '页面返回：' + res.toast;
+      phSt.className = 'status ' + (bad ? 'err' : 'ok');
+    } else if (res.err) {
+      phSt.textContent = res.err; phSt.className = 'status err';
+    } else {
+      phSt.textContent = '已触发发送（' + (res.area || area) + '）· 收到验证码后填入下方';
+      phSt.className = 'status ok';
+    }
+    refresh(true);
+  } catch (e) { phSt.textContent = String(e); phSt.className = 'status err'; }
+  finally { $('sendBtn').disabled = false; }
+}
+
+async function verifyCode() {
+  if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
+  const code = $('code').value.trim();
+  if (!code) { phSt.textContent = '请填验证码'; phSt.className = 'status warn'; return; }
+  phSt.textContent = '提交中…'; phSt.className = 'status';
+  try {
+    const r = await fetch('/login/phone/verify', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + KEY, 'content-type': 'application/json' },
+      body: JSON.stringify({ code: code })
+    });
+    const d = await r.json();
+    const res = d.result || {};
+    if (res.logged_in) { phSt.textContent = '登录成功 ✓ 登录态已持久化到容器'; phSt.className = 'status ok'; }
+    else { phSt.textContent = '未登录成功' + (res.toast ? '：' + res.toast : ''); phSt.className = 'status err'; }
+    refresh(true);
+  } catch (e) { phSt.textContent = String(e); phSt.className = 'status err'; }
+}
+
+async function checkState() {
+  if (!KEY) return;
+  const w = $('warn');
+  try {
+    const r = await fetch('/admin/state', { headers: { 'Authorization': 'Bearer ' + KEY } });
+    const d = (await r.json()).result || {};
+    if (d.frozen) {
+      w.className = 'warnbar'; w.style.display = '';
+      w.textContent = '⚠️ 容器当前账号已被冻结，页面上没有「登录」按钮 —— 请先点下方「重置登录态」，再扫码或用手机号登入新账号。';
+    } else if (d.logged_in) {
+      const wm = d.watermark || {};
+      const wmTxt = (wm.enabled === true) ? '· 无水印保存 已开启 ✓'
+                  : (wm.enabled === false) ? '· 无水印保存 未开启（正在自动补开…）'
+                  : '· 无水印保存 待检测';
+      w.className = 'okbar'; w.style.display = '';
+      w.textContent = '✓ 容器已登录（' + (d.url || '') + '） ' + wmTxt;
+    } else {
+      w.style.display = 'none';
+    }
+  } catch (e) {}
+}
+
+async function resetLogin() {
+  if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
+  st.textContent = '重置登录态中（清 cookie + localStorage 并重载页面）…'; st.className = 'status';
+  try {
+    const r = await fetch('/login/reset', { method: 'POST', headers: { 'Authorization': 'Bearer ' + KEY } });
+    const d = await r.json();
+    st.textContent = d.error ? ('重置失败：' + d.error) : '已重置登录态 · 现在可用微信扫码或手机号登入新账号';
+    st.className = 'status ' + (d.error ? 'err' : 'ok');
+    checkState(); refresh(true);
   } catch (e) { st.textContent = String(e); st.className = 'status err'; }
 }
-setInterval(refresh, 20000);
-if (KEY) refresh(true); else st.textContent = '请先填写门禁 Key';
+
+setInterval(function () { if (TAB === 'wechat') refresh(); checkState(); }, 20000);
+setTab(TAB);
+checkState();
 </script>
 </body>
 </html>
@@ -1519,7 +2508,7 @@ ADMIN_HTML = """<!DOCTYPE html>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let KEY = localStorage.getItem('yb_key') || '';
+const _qk = (new URLSearchParams(location.search).get('k') || '').trim(); let KEY = ''; try { KEY = _qk || (localStorage.getItem('yb_key') || '').trim(); if (_qk) localStorage.setItem('yb_key', _qk); } catch (e) { KEY = _qk || ''; }
 $('key').value = KEY;
 
 function authHeaders() { return { 'Authorization': 'Bearer ' + KEY, 'content-type': 'application/json' }; }
@@ -1527,7 +2516,7 @@ function setMsg(el, text, cls) { const e = $(el); e.textContent = text; e.classN
 
 function saveKey() {
   KEY = $('key').value.trim();
-  localStorage.setItem('yb_key', KEY);
+  try { localStorage.setItem('yb_key', KEY); } catch (e) {}
   $('keyBadge').textContent = KEY ? '已保存' : '未设置';
   $('keyBadge').className = 'badge ' + (KEY ? 'ok' : '');
   probe(); loadShot();
@@ -1553,19 +2542,13 @@ async function probe() {
   }
 }
 
-async function loadShot() {
+function loadShot() {
   if (!KEY) return;
   $('shotBadge').textContent = '加载中';
-  try {
-    const r = await fetch('/login', { headers: { 'Authorization': 'Bearer ' + KEY } });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const b = await r.blob();
-    $('shot').src = URL.createObjectURL(b);
-    $('shotBadge').textContent = new Date().toLocaleTimeString();
-    $('shotBadge').className = 'badge ok';
-  } catch (e) {
-    $('shotBadge').textContent = '失败'; $('shotBadge').className = 'badge err';
-  }
+  const im = $('shot');
+  im.onload = () => { $('shotBadge').textContent = new Date().toLocaleTimeString(); $('shotBadge').className = 'badge ok'; };
+  im.onerror = () => { $('shotBadge').textContent = '失败'; $('shotBadge').className = 'badge err'; };
+  im.src = '/login?k=' + encodeURIComponent(KEY) + '&t=' + Date.now();
 }
 
 async function sendCode() {
@@ -1611,86 +2594,450 @@ async function verifyCode() {
 """
 
 
-POOL_HTML = """<!DOCTYPE html>
+# 各管理页共用的顶部导航。渲染时用 _page() 统一注入到 <body> 之后，
+# 这样每个页面 HTML 不用各自维护一份导航。本地已存的 key 会自动带到目标页。
+NAV_HTML = """<style>
+  .ybnav { display:flex; gap:8px; flex-wrap:wrap; margin:0 0 16px; font-size:12px; }
+  .ybnav a { color:#534AB7; text-decoration:none; border:1px solid #e6e4df; border-radius:99px;
+             padding:3px 12px; background:#fff; }
+  .ybnav a.cur { border-color:#534AB7; background:#f3f1fc; font-weight:500; }
+</style>
+<div class="ybnav">
+  <a data-h="/pool,/manage" href="/pool">号池管理</a>
+  <a data-h="/stats" href="/stats">调用统计</a>
+  <a data-h="/qr" href="/qr">扫码 / 登录</a>
+  <a data-h="/admin" href="/admin">单实例</a>
+</div>
+<script>
+(function () {
+  var k = '';
+  try { k = localStorage.getItem('yb_key') || ''; } catch (e) {}
+  document.querySelectorAll('.ybnav a').forEach(function (a) {
+    var h = (a.getAttribute('data-h') || '').split(',');
+    if (k) a.href = h[0] + '?k=' + encodeURIComponent(k);
+    if (h.indexOf(location.pathname) >= 0) a.className = 'cur';
+  });
+})();
+</script>
+"""
+
+
+def _page(html: str) -> str:
+    """给页面注入共享导航（插在 <body> 之后）。"""
+    return html.replace("<body>", "<body>" + NAV_HTML, 1)
+
+
+MANAGE_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>元宝号池总览</title>
+<title>元宝号池管理</title>
 <style>
-  :root { --bg:#faf9f7; --card:#fff; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; --ok:#3B6D11; --err:#A32D2D; }
+  :root { --bg:#faf9f7; --card:#fff; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; --ok:#3B6D11; --err:#A32D2D; --warn:#854F0B; }
+  * { box-sizing:border-box; }
   body { margin:0; padding:24px; background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
   h1 { font-size:18px; font-weight:500; margin:0 0 4px; }
-  .sub { color:var(--muted); font-size:12px; margin-bottom:18px; }
-  .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:14px; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; }
-  .card h2 { font-size:14px; font-weight:500; margin:0 0 8px; display:flex; justify-content:space-between; align-items:center; }
-  .badge { font-size:11px; padding:2px 8px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:14px; font-weight:500; margin:0 0 10px; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  .bar > div { flex:1; min-width:240px; }
+  input { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:13px inherit; background:#fff; color:var(--text); }
+  button { padding:7px 12px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:8px; font:12px inherit; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  button.danger { border-color:var(--err); color:var(--err); background:#fff; }
+  button.okb { border-color:var(--ok); color:var(--ok); background:#fff; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); vertical-align:middle; }
+  th { color:var(--muted); font-weight:400; }
+  td.num, th.num { text-align:right; }
+  .badge { font-size:11px; padding:1px 8px; border-radius:99px; border:1px solid var(--line); color:var(--muted); white-space:nowrap; }
   .badge.ok { color:var(--ok); border-color:var(--ok); }
   .badge.err { color:var(--err); border-color:var(--err); }
+  .badge.warn { color:var(--warn); border-color:var(--warn); }
   .muted { color:var(--muted); font-size:12px; }
-  input { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:13px inherit; margin-top:8px; }
-  a { color:var(--accent); }
-  img { width:100%; border:1px solid var(--line); border-radius:8px; margin-top:10px; }
-  button { margin-top:10px; padding:7px 12px; border:1px solid var(--accent); background:#fff; color:var(--accent); border-radius:8px; cursor:pointer; font:13px inherit; }
+  .acts { display:flex; gap:6px; flex-wrap:wrap; }
+  .rules { display:flex; gap:18px; flex-wrap:wrap; font-size:12px; color:var(--muted); }
+  .rules b { color:var(--text); font-weight:500; }
+  code { background:#f1efe8; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .err-txt { color:var(--err); font-size:12px; }
+  .scroll { max-height:300px; overflow:auto; }
 </style>
 </head>
 <body>
-<h1>元宝号池总览</h1>
-<div class="sub">实例列表来自服务端 YB_POOL_PEERS 配置 · 状态实时探测</div>
-<label class="muted">门禁 Key（本地保存）</label>
-<input id="key" type="password" placeholder="sk-yuanbao-...">
-<div class="grid" id="pool" style="margin-top:16px"></div>
+<h1>元宝号池管理</h1>
+<div class="sub">生命周期（启用 / 禁用 / 隔离 / 剔除）· 自动规则 · 批量运维 · 轮询入口</div>
+
+<div class="bar">
+  <div><input id="key" type="password" placeholder="门禁 Key 或 YB_FLEET_KEY"></div>
+  <button onclick="saveKey()">保存并刷新</button>
+  <button class="ghost" onclick="load()">刷新</button>
+  <button class="ghost" onclick="batch('keepalive')">批量保活</button>
+  <button class="ghost" onclick="batch('watermark')">批量开无水印</button>
+  <button class="ghost" onclick="batch('state')">批量查状态</button>
+</div>
+<div id="opMsg" class="muted" style="margin-bottom:12px"></div>
+
+<div class="card">
+  <h2>账号清单 <span class="muted" id="sum"></span></h2>
+  <div id="list" class="muted">加载中…</div>
+</div>
+
+<div class="card">
+  <h2>自动规则与轮询入口</h2>
+  <div class="rules" id="rules"></div>
+</div>
+
+<div class="card">
+  <h2>状态变更历史</h2>
+  <div class="scroll"><div id="hist" class="muted">加载中…</div></div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
-let KEY = localStorage.getItem('yb_key') || '';
+const _qk = (new URLSearchParams(location.search).get('k') || '').trim();
+let KEY = '';
+try { KEY = _qk || (localStorage.getItem('yb_key') || '').trim(); if (_qk) localStorage.setItem('yb_key', _qk); } catch (e) { KEY = _qk || ''; }
 $('key').value = KEY;
-$('key').onchange = () => { KEY = $('key').value.trim(); localStorage.setItem('yb_key', KEY); render(); };
+let LAST = null;
 
-async function peers() { const r = await fetch('/admin/peers'); return (await r.json()).peers || []; }
+function H() { return { 'Authorization': 'Bearer ' + KEY, 'content-type': 'application/json' }; }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function saveKey() { KEY = $('key').value.trim(); try { localStorage.setItem('yb_key', KEY); } catch (e) {} load(); }
 
-async function render() {
-  const list = await peers();
-  $('pool').innerHTML = '';
-  if (!list.length) { $('pool').innerHTML = '<div class="card muted">未配置实例（YB_POOL_PEERS 为空）</div>'; return; }
-  for (const p of list) {
-    const el = document.createElement('div');
-    el.className = 'card';
-    el.innerHTML = '<h2>' + p.name + ' <span class="badge" id="b_' + p.id + '">检测中</span></h2>'
-      + '<div class="muted" id="m_' + p.id + '">' + p.url + '</div>';
-    $('pool').appendChild(el);
-    probePeer(p);
-  }
+const STATE_BADGE = {
+  enabled: '<span class="badge ok">启用</span>',
+  disabled: '<span class="badge warn">手动禁用</span>',
+  quarantined: '<span class="badge err">自动隔离</span>',
+  ejected: '<span class="badge err">已剔除</span>',
+  unknown: '<span class="badge">未知</span>'
+};
+
+function healthBadge(h) {
+  if (!h) return '<span class="badge">未探测</span>';
+  const t = h.iso || (h.at ? new Date(h.at * 1000).toLocaleString() : '');
+  if (h.frozen) return '<span class="badge err" title="' + esc(t) + '">已冻结</span>';
+  return h.ok ? '<span class="badge ok" title="' + esc(t) + '">正常 ' + (h.status || '') + '</span>'
+              : '<span class="badge err" title="' + esc(t) + '">异常 ' + (h.status == null ? '' : h.status) + '</span>';
 }
 
-async function probePeer(p) {
-  const badge = $('b_' + p.id), info = $('m_' + p.id);
+async function load() {
+  if (!KEY) { $('list').textContent = '请先填写门禁 Key'; return; }
   try {
-    const t0 = Date.now();
-    const r = await fetch(p.url + '/v1/models', { headers: { 'Authorization': 'Bearer ' + KEY } });
-    const ms = Date.now() - t0;
-    if (r.status === 401) { badge.textContent = 'Key 无效'; badge.className = 'badge err'; return; }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    badge.textContent = '在线 ' + ms + 'ms'; badge.className = 'badge ok';
-    info.innerHTML = p.url + ' · <a href="' + p.url + '/admin" target="_blank">管理页</a>';
-    try {
-      const sr = await fetch(p.url + '/login', { headers: { 'Authorization': 'Bearer ' + KEY } });
-      if (sr.ok) {
-        const shot = document.createElement('img');
-        shot.src = URL.createObjectURL(await sr.blob());
-        badge.closest('.card').appendChild(shot);
-      }
-    } catch (e) {}
-  } catch (e) {
-    badge.textContent = '异常'; badge.className = 'badge err';
-    info.textContent = p.url + ' · ' + String(e);
+    const r = await fetch('/admin/accounts', { headers: H() });
+    if (r.status === 401) { $('list').innerHTML = '<span class="err-txt">Key 被拒绝（401）</span>'; return; }
+    const d = await r.json();
+    LAST = d;
+    $('sum').textContent = '（可路由 ' + d.routable + ' / 共 ' + d.total + '）';
+    const a = d.auto || {};
+    $('rules').innerHTML =
+      '<span>自动隔离：连续失败 ≥ <b>' + a.disable_after + '</b> 次 或 账号被冻结</span>'
+      + '<span>自动恢复：连续成功 ≥ <b>' + (a.reenable_after || '关闭') + '</b> 次（仅回滚自动隔离）</span>'
+      + '<span>自动剔除：隔离超 <b>' + (a.eject_after_days ? a.eject_after_days + ' 天' : '关闭') + '</b></span>'
+      + '<span>轮询入口：<code>' + esc(d.router_entry) + '/…</code> ' + (d.router_enabled ? '<span class="badge ok">已开启</span>' : '<span class="badge warn">已关闭</span>') + '</span>'
+      + '<span>已轮询次数：<b>' + (d.rotation_index || 0) + '</b></span>';
+    render(d.accounts || []);
+  } catch (e) { $('list').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+function render(accs) {
+  if (!accs.length) { $('list').textContent = '号池为空（YB_POOL_PEERS 未配置）'; return; }
+  let h = '<table><tr><th>账号</th><th>地址</th><th>状态</th><th>原因</th><th class="num">连续失败</th><th>健康</th><th class="num">24h(成功/失败)</th><th>操作</th></tr>';
+  const hist = [];
+  for (const a of accs) {
+    const st = a.state || {};
+    const s = a.stats || {};
+    const nm = esc(a.name || a.url);
+    h += '<tr>';
+    h += '<td>' + nm + (a.self ? ' <span class="badge">本实例</span>' : '') + '</td>';
+    h += '<td class="muted">' + esc(a.error || a.url || '') + '</td>';
+    h += '<td>' + (STATE_BADGE[st.state] || STATE_BADGE.unknown) + '</td>';
+    h += '<td class="muted">' + esc((st.reason || '').slice(0, 46)) + '</td>';
+    h += '<td class="num">' + (st.fail_streak == null ? '·' : st.fail_streak) + '</td>';
+    h += '<td>' + healthBadge(st.last_health) + '</td>';
+    h += '<td class="num"><span style="color:#3B6D11">' + (s.ok || 0) + '</span> / <span style="color:#A32D2D">' + (s.err || 0) + '</span></td>';
+    const name = esc(a.name || '');
+    h += '<td><div class="acts">'
+      + '<button class="okb" onclick="act(\\'' + name + '\\',\\'enable\\')">启用</button>'
+      + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'disable\\')">禁用</button>'
+      + '<button class="danger" onclick="act(\\'' + name + '\\',\\'eject\\')">剔除</button>'
+      + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'reset\\')">重置</button>'
+      + '</div></td>';
+    h += '</tr>';
+    for (const ev of (st.history || []).slice(-6).reverse()) {
+      hist.push({ name: a.name, t: ev.iso || ev.at, action: ev.action, reason: ev.reason, by: ev.by });
+    }
+  }
+  h += '</table>';
+  $('list').innerHTML = h;
+  hist.sort((x, y) => String(y.t).localeCompare(String(x.t)));
+  if (!hist.length) { $('hist').textContent = '暂无变更记录'; }
+  else {
+    let t = '<table><tr><th>时间</th><th>账号</th><th>动作</th><th>原因</th><th>来源</th></tr>';
+    hist.slice(0, 40).forEach(e => {
+      t += '<tr><td class="muted">' + esc(e.t) + '</td><td>' + esc(e.name) + '</td><td>' + esc(e.action)
+        + '</td><td>' + esc(e.reason || '') + '</td><td class="muted">' + esc(e.by) + '</td></tr>';
+    });
+    $('hist').innerHTML = t + '</table>';
   }
 }
-render();
+
+async function act(name, action) {
+  let reason = '';
+  if (action !== 'enable' && action !== 'reset') {
+    reason = prompt('给这次「' + action + '」写个原因（可留空）：', '') || '';
+  }
+  try {
+    const r = await fetch('/admin/account', { method: 'POST', headers: H(),
+      body: JSON.stringify({ action: action, reason: reason, name: name }) });
+    const d = await r.json();
+    $('opMsg').innerHTML = d.error ? '<span class="err-txt">' + esc(d.error) + '</span>'
+      : '已对 <b>' + esc(name) + '</b> 执行 <b>' + esc(action) + '</b>';
+    load();
+  } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+async function batch(op) {
+  if (!KEY) return;
+  $('opMsg').textContent = '批量 ' + op + ' 执行中…';
+  try {
+    const r = await fetch('/admin/fleet/' + op, { method: 'POST', headers: H(), body: JSON.stringify({ enabled: true }) });
+    const d = await r.json();
+    if (d.error) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(d.error) + '</span>'; return; }
+    const bad = (d.results || []).filter(x => !x.ok);
+    $('opMsg').innerHTML = '批量 ' + op + '：成功 <b>' + d.ok + '</b> / 共 <b>' + d.total + '</b>'
+      + (bad.length ? ' · 失败：' + bad.map(x => esc(x.name || x.url)).join('、') : '');
+    load();
+  } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+if (KEY) load(); else $('list').textContent = '请先填写门禁 Key（或 YB_FLEET_KEY）';
 </script>
 </body>
 </html>
 """
+
+
+STATS_HTML = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>元宝号池统计</title>
+<style>
+  :root { --bg:#faf9f7; --card:#fff; --line:#e6e4df; --text:#2c2c2a; --muted:#6b6a66; --accent:#534AB7; --ok:#3B6D11; --err:#A32D2D; --warn:#854F0B; }
+  * { box-sizing:border-box; }
+  body { margin:0; padding:24px; background:var(--bg); color:var(--text); font:14px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif; }
+  h1 { font-size:18px; font-weight:500; margin:0 0 4px; }
+  .sub { color:var(--muted); font-size:12px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .card h2 { font-size:14px; font-weight:500; margin:0 0 10px; }
+  .bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-bottom:14px; }
+  .bar > div { flex:1; min-width:240px; }
+  input, select { width:100%; padding:8px 10px; border:1px solid var(--line); border-radius:8px; font:13px inherit; background:#fff; color:var(--text); }
+  button { padding:8px 13px; border:1px solid var(--accent); background:var(--accent); color:#fff; border-radius:8px; font:13px inherit; cursor:pointer; }
+  button.ghost { background:#fff; color:var(--accent); }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  table { width:100%; border-collapse:collapse; font-size:12px; }
+  th, td { text-align:left; padding:6px 8px; border-bottom:1px solid var(--line); white-space:nowrap; }
+  th { color:var(--muted); font-weight:400; }
+  td.num, th.num { text-align:right; }
+  .badge { font-size:11px; padding:1px 7px; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
+  .badge.ok { color:var(--ok); border-color:var(--ok); }
+  .badge.err { color:var(--err); border-color:var(--err); }
+  .badge.warn { color:var(--warn); border-color:var(--warn); }
+  .muted { color:var(--muted); font-size:12px; }
+  .ok { color:var(--ok); } .errc { color:var(--err); }
+  .spark { display:flex; gap:2px; align-items:flex-end; height:40px; margin-top:6px; }
+  .spark i { flex:1; background:#CECBF6; border-radius:2px 2px 0 0; min-height:2px; }
+  .spark i.has { background:#534AB7; }
+  .grid2 { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:16px; }
+  code { background:#f1efe8; padding:1px 5px; border-radius:4px; font-size:12px; }
+  .scroll { max-height:420px; overflow:auto; }
+</style>
+</head>
+<body>
+<h1>元宝号池统计</h1>
+<div class="sub">账号 × 模型 调用量 · 明细日志 · 批量运维（保活 / 无水印 / 状态）</div>
+
+<div class="bar">
+  <div><input id="key" type="password" placeholder="门禁 Key 或 YB_FLEET_KEY"></div>
+  <button onclick="saveKey()">保存并刷新</button>
+  <button class="ghost" onclick="load()">刷新</button>
+  <button class="ghost" onclick="fleet('keepalive')">批量保活</button>
+  <button class="ghost" onclick="fleet('watermark')">批量开启无水印</button>
+  <button class="ghost" onclick="fleet('state')">批量查状态</button>
+</div>
+<div id="opMsg" class="muted" style="margin-bottom:12px"></div>
+
+<div class="card">
+  <h2>账号 × 模型 调用矩阵 <span class="muted" id="winInfo"></span></h2>
+  <div id="matrix" class="muted">加载中…</div>
+</div>
+
+<div class="grid2">
+  <div class="card">
+    <h2>本实例模型明细</h2>
+    <div id="models" class="muted">加载中…</div>
+  </div>
+  <div class="card">
+    <h2>按天走势</h2>
+    <div id="series" class="muted">加载中…</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>调用明细日志</h2>
+  <div class="bar" style="margin-bottom:10px">
+    <div style="max-width:160px"><select id="fModel" onchange="loadDetail()"><option value="">全部模型</option></select></div>
+    <div style="max-width:130px"><select id="fOk" onchange="loadDetail()"><option value="">全部结果</option><option value="true">成功</option><option value="false">失败</option></select></div>
+    <div style="max-width:120px"><select id="fLimit" onchange="loadDetail()"><option>50</option><option selected>100</option><option>500</option></select></div>
+    <button class="ghost" onclick="loadDetail()">刷新明细</button>
+    <button class="ghost" onclick="exportLog()">导出 JSONL</button>
+  </div>
+  <div class="scroll"><div id="detail" class="muted">加载中…</div></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const _qk = (new URLSearchParams(location.search).get('k') || '').trim();
+let KEY = '';
+try { KEY = _qk || (localStorage.getItem('yb_key') || '').trim(); if (_qk) localStorage.setItem('yb_key', _qk); } catch (e) { KEY = _qk || ''; }
+$('key').value = KEY;
+let DAYS = 7;
+function H() { return { 'Authorization': 'Bearer ' + KEY, 'content-type': 'application/json' }; }
+function esc(s) { return String(s == null ? '' : s).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c])); }
+function saveKey() { KEY = $('key').value.trim(); try { localStorage.setItem('yb_key', KEY); } catch (e) {} load(); }
+
+async function jget(url, opt) { const r = await fetch(url, opt || { headers: H() }); if (!r.ok && r.status !== 401) throw new Error('HTTP ' + r.status); return r.json(); }
+
+async function load() {
+  if (!KEY) { $('matrix').textContent = '请先填写门禁 Key'; return; }
+  try {
+    const fleet = await jget('/admin/fleet/stats?days=' + DAYS);
+    renderMatrix(fleet);
+    const st = await jget('/admin/stats?days=' + DAYS);
+    renderModels(st.result); renderSeries(st.result);
+    loadDetail();
+  } catch (e) { $('matrix').innerHTML = '<span class="errc">' + esc(e) + '</span>'; }
+}
+
+function renderMatrix(f) {
+  const accs = f.accounts || [];
+  const models = f.by_model || [];
+  $('winInfo').textContent = '（近 ' + f.window_days + ' 天）' + (f.fleet_key_set ? '' : ' · 未设 YB_FLEET_KEY，仅本实例');
+  if (!accs.length) { $('matrix').textContent = '无数据'; return; }
+  const allModels = [];
+  models.forEach(m => allModels.push(m.model));
+  accs.forEach(a => Object.keys(a.models || {}).forEach(m => { if (allModels.indexOf(m) < 0) allModels.push(m); }));
+  let h = '<table><tr><th>账号</th><th>实例</th><th class="num">窗口调用</th><th class="num">成功</th><th class="num">失败</th>';
+  allModels.forEach(m => { h += '<th class="num">' + esc(m) + '</th>'; });
+  h += '<th class="num">累计</th></tr>';
+  for (const a of accs) {
+    const st = a.ok ? '<span class="badge ok">在线</span>' : '<span class="badge err">异常</span>';
+    h += '<tr><td>' + esc(a.name) + ' ' + (a.self ? '<span class="badge">本实例</span>' : '') + '</td>'
+      + '<td class="muted">' + esc(a.error || a.url || '') + '</td>'
+      + '<td class="num">' + a.total + '</td><td class="num ok">' + a.ok_n + '</td>'
+      + '<td class="num ' + (a.err_n ? 'errc' : '') + '">' + a.err_n + '</td>';
+    allModels.forEach(m => { const n = (a.models || {})[m] || 0; h += '<td class="num">' + (n || '<span class="muted">·</span>') + '</td>'; });
+    h += '<td class="num">' + a.all_time + '</td></tr>';
+  }
+  h += '<tr><th>合计</th><th></th>';
+  const tot = accs.reduce((s, a) => s + a.total, 0), okt = accs.reduce((s, a) => s + a.ok_n, 0), ert = accs.reduce((s, a) => s + a.err_n, 0);
+  h += '<th class="num">' + tot + '</th><th class="num">' + okt + '</th><th class="num">' + ert + '</th>';
+  allModels.forEach(m => { const row = models.find(x => x.model === m); h += '<th class="num">' + (row ? row.n : 0) + '</th>'; });
+  h += '<th></th></tr></table>';
+  $('matrix').innerHTML = h;
+
+  const sel = $('fModel'); const cur = sel.value;
+  sel.innerHTML = '<option value="">全部模型</option>' + allModels.map(m => '<option>' + esc(m) + '</option>').join('');
+  sel.value = cur;
+}
+
+function renderModels(r) {
+  const ms = r.by_model || [];
+  if (!ms.length) { $('models').textContent = '窗口内无调用'; return; }
+  let h = '<table><tr><th>模型</th><th class="num">次数</th><th class="num">成功/失败</th><th class="num">均耗时</th><th class="num">token(入/出)</th></tr>';
+  ms.forEach(m => {
+    h += '<tr><td>' + esc(m.model) + '</td><td class="num">' + m.n + '</td>'
+      + '<td class="num"><span class="ok">' + m.ok + '</span>/<span class="' + (m.err ? 'errc' : 'muted') + '">' + m.err + '</span></td>'
+      + '<td class="num">' + m.avg_ms + 'ms</td>'
+      + '<td class="num">' + m.prompt_tokens + '/' + m.completion_tokens + '</td></tr>';
+  });
+  h += '</table>';
+  $('models').innerHTML = h;
+}
+
+function renderSeries(r) {
+  const s = r.series || [];
+  const max = Math.max(1, ...s.map(x => x.n));
+  let h = '<div class="spark">';
+  s.forEach(x => {
+    const pct = Math.round(x.n / max * 100);
+    h += '<i class="' + (x.n ? 'has' : '') + '" style="height:' + Math.max(2, pct) + '%" title="' + x.date + ' · ' + x.n + ' 次"></i>';
+  });
+  h += '</div><div class="muted" style="display:flex;justify-content:space-between;margin-top:4px">'
+    + '<span>' + (s[0] ? s[0].date : '') + '</span><span>峰值 ' + max + '</span><span>' + (s.length ? s[s.length - 1].date : '') + '</span></div>';
+  const tot = s.reduce((a, x) => a + x.n, 0);
+  $('series').innerHTML = h + '<div class="muted" style="margin-top:8px">窗口合计 ' + tot + ' 次</div>';
+}
+
+async function loadDetail() {
+  if (!KEY) return;
+  const q = new URLSearchParams({ limit: $('fLimit').value, model: $('fModel').value, ok: $('fOk').value });
+  try {
+    const d = await jget('/admin/stats/detail?' + q.toString());
+    const rows = d.result || [];
+    if (!rows.length) { $('detail').textContent = '暂无记录'; return; }
+    let h = '<table><tr><th>时间</th><th>账号</th><th>模型</th><th>端点</th><th class="num">状态</th><th class="num">耗时</th><th>流式</th><th class="num">token</th><th>调用方</th></tr>';
+    rows.forEach(e => {
+      const u = e.usage || {};
+      h += '<tr><td>' + esc(e.ts_iso || '') + '</td><td>' + esc(e.instance || '') + '</td>'
+        + '<td>' + esc(e.model || '') + '</td><td class="muted">' + esc((e.endpoint || '').replace('/v1/', '')) + '</td>'
+        + '<td class="num"><span class="badge ' + (e.ok ? 'ok' : 'err') + '">' + e.status + '</span></td>'
+        + '<td class="num">' + (e.ms || 0) + 'ms</td><td>' + (e.stream ? '是' : '') + '</td>'
+        + '<td class="num">' + (u.total_tokens || '') + '</td>'
+        + '<td class="muted">' + esc(e.key || '') + '</td></tr>';
+      if (e.err) h += '<tr><td></td><td colspan="8" class="errc">' + esc(e.err) + '</td></tr>';
+    });
+    h += '</table>';
+    $('detail').innerHTML = h;
+  } catch (e) { $('detail').innerHTML = '<span class="errc">' + esc(e) + '</span>'; }
+}
+
+async function fleet(op) {
+  if (!KEY) return;
+  $('opMsg').textContent = '批量 ' + op + ' 执行中…';
+  try {
+    const r = await fetch('/admin/fleet/' + op, { method: 'POST', headers: H(), body: JSON.stringify({ enabled: true }) });
+    const d = await r.json();
+    if (d.error) { $('opMsg').innerHTML = '<span class="errc">' + esc(d.error) + '</span>'; return; }
+    const bad = (d.results || []).filter(x => !x.ok);
+    $('opMsg').innerHTML = '批量 ' + op + '：成功 <b>' + d.ok + '</b> / 共 <b>' + d.total + '</b>'
+      + (bad.length ? ' · 失败：' + bad.map(x => esc(x.name || x.url)).join('、') : '');
+    load();
+  } catch (e) { $('opMsg').innerHTML = '<span class="errc">' + esc(e) + '</span>'; }
+}
+
+async function exportLog() {
+  if (!KEY) return;
+  const r = await fetch('/admin/stats/export', { headers: { 'Authorization': 'Bearer ' + KEY } });
+  const b = await r.blob();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(b); a.download = 'yuanbao-stats.jsonl'; a.click();
+}
+
+if (KEY) load(); else $('matrix').textContent = '请先填写门禁 Key（或 YB_FLEET_KEY）';
+</script>
+</body>
+</html>
+"""
+
+
+POOL_HTML = MANAGE_HTML   # /pool 与 /manage 是同一个"号池管理"页（保留 /pool 这个老入口）
+
 
 
 def _pool_peers():
@@ -1713,7 +3060,12 @@ def _pool_peers():
                 name, url = item.split("=", 1)
             else:
                 name, url = f"acc{i+1}", item
-            peers.append({"name": name.strip(), "url": url.strip().rstrip("/")})
+            name, url = name.strip(), url.strip()
+            # 支持 name=url|key —— 轮询转发需要目标实例自己的 API key（/v1 只认实例 key）
+            pkey = ""
+            if "|" in url:
+                url, pkey = url.split("|", 1)
+            peers.append({"name": name, "url": url.strip().rstrip("/"), "key": pkey.strip()})
     for i, x in enumerate(peers):
         x["id"] = f"p{i}"
         x.setdefault("name", f"acc{i+1}")
@@ -1723,18 +3075,28 @@ def _pool_peers():
 @app.get("/admin", response_class=Response)
 async def admin_page(req: Request):
     # 页面壳免鉴权（无 Key 者需打开页面输入 Key）；所有数据端点仍校门禁
-    return Response(content=ADMIN_HTML, media_type="text/html; charset=utf-8")
+    return Response(content=_page(ADMIN_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/qr", response_class=Response)
 async def qr_page(req: Request):
     # 扫码专用页（壳免鉴权，截图走带 Key 的 fetch）
-    return Response(content=QR_HTML, media_type="text/html; charset=utf-8")
+    return Response(content=_page(QR_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/pool", response_class=Response)
 async def pool_page(req: Request):
-    return Response(content=POOL_HTML, media_type="text/html; charset=utf-8")
+    return Response(content=_page(POOL_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/stats", response_class=Response)
+async def stats_page(req: Request):
+    return Response(content=_page(STATS_HTML), media_type="text/html; charset=utf-8")
+
+
+@app.get("/manage", response_class=Response)
+async def manage_page(req: Request):
+    return Response(content=_page(MANAGE_HTML), media_type="text/html; charset=utf-8")
 
 
 @app.get("/admin/whoami")
@@ -1779,7 +3141,7 @@ async def admin_proxy_rotate(req: Request):
 
 @app.get("/admin/peers")
 async def admin_peers(req: Request):
-    cred = _check_auth(req)
+    cred = _check_admin_panel_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
     return {"peers": _pool_peers()}
@@ -1788,6 +3150,7 @@ async def admin_peers(req: Request):
 @app.get("/v1/models")
 async def list_models(req: Request):
     cred = _check_auth(req)
+    _mctx(model="(models)")
     if isinstance(cred, JSONResponse):
         return cred
     now = int(time.time())
@@ -1984,6 +3347,7 @@ async def chat_completions(req: Request):
         return JSONResponse({"error": {"message": f"元宝 HTTP {result['status']}", "type": "api_error"}}, status_code=502)
 
     parsed = _parse_chat_sse(result["text"])
+    _mctx(model=model_in, stream=stream, usage=parsed.get("usage"))
     if parsed["error"] and not parsed["content"]:
         return JSONResponse({"error": {"message": parsed["error"], "type": "api_error"}}, status_code=502)
 
@@ -2064,6 +3428,7 @@ def _size_to_ratio(size: str) -> Optional[str]:
 @app.post("/v1/images/generations")
 async def images_generations(req: Request):
     cred = _check_auth(req)
+    _mctx(endpoint=req.url.path)
     if isinstance(cred, JSONResponse):
         return cred
     cookie_str = cred[1] if isinstance(cred, tuple) else None

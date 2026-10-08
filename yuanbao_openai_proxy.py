@@ -49,6 +49,7 @@ YUANBAO_CONVERSATION = os.environ.get("YUANBAO_CONVERSATION", "")  # 固定会�
 YUANBAO_API_KEY = os.environ.get("YUANBAO_API_KEY", "")  # 门禁 key；空=不校验（客户端 Bearer 随意）
 YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(不进历史，反风控)；0=普通
 YB_DELETE_CONV = os.environ.get("YB_DELETE_CONV", "1")    # 1=生成完自动删除本次创建的会话（历史零残留）
+YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")    # 1=默认走官方 create 建会话（与前端行为一致，反风控优先）；0=客户端 UUID 捷径（少一次请求，但属非官方行为模式）
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
 YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
 YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙")自动退避重试次数
@@ -914,8 +915,17 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
         def run_once(sig):
             if YUANBAO_CONVERSATION:
                 conv = YUANBAO_CONVERSATION
+            elif YB_CREATE_CONV == "1":
+                r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
+                                  {"agentId": agent_id}, sig, agent_id)
+                if r["status"] == 401:
+                    return {"status": 401, "text": r["text"]}
+                conv = json.loads(r["text"]).get("id")
+                if not conv:
+                    raise RuntimeError("创建会话失败: " + r["text"][:150])
+                created_convs.append(conv)
             else:
-                # 借鉴旧版 MeUtils：客户端 UUID 直当会话，跳过 create
+                # 可选捷径（YB_CREATE_CONV=0）：默认关闭
                 conv = str(uuid.uuid4())
                 created_convs.append(conv)
             if image_refs or force_image:
@@ -1102,8 +1112,11 @@ async def chat_completions(req: Request):
             with _bsk_lock:
                 if YUANBAO_CONVERSATION:
                     conv = YUANBAO_CONVERSATION
+                elif YB_CREATE_CONV == "1":
+                    conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    conv_created = conv
                 else:
-                    # 借鉴旧版 MeUtils：客户端自造 UUID 直当会话 ID，跳过 create 调用
+                    # 可选捷径（YB_CREATE_CONV=0）：客户端 UUID 直当会话 ID，跳过 create；默认关闭（反风控优先）
                     conv = str(uuid.uuid4())
                     conv_created = conv
                 sig = get_sig(tab)
@@ -1343,8 +1356,11 @@ async def images_generations(req: Request):
             with _bsk_lock:
                 if YUANBAO_CONVERSATION:
                     conv = YUANBAO_CONVERSATION
+                elif YB_CREATE_CONV == "1":
+                    conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    conv_created = conv
                 else:
-                    # 借鉴旧版 MeUtils：客户端自造 UUID 直当会话 ID，跳过 create 调用
+                    # 可选捷径（YB_CREATE_CONV=0）：客户端 UUID 直当会话 ID，跳过 create；默认关闭（反风控优先）
                     conv = str(uuid.uuid4())
                     conv_created = conv
                 sig = get_sig(tab)

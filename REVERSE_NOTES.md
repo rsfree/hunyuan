@@ -236,8 +236,9 @@ hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-
 
 - 旧实现在今天已失效：仅 cookie 调 chat → 401；极简 payload → 400（缺 agentId 等新必填）
 - **已借鉴落地**：
-  1. **客户端 UUID 直当会话 ID**（跳过 conversation/create，省一次请求）——chat/images/
-     cookie 模式三处已改，配合「用完即删」依旧零残留
+  1. **客户端 UUID 直当会话 ID**（跳过 conversation/create，省一次请求）——已实现为
+     `YB_CREATE_CONV=0` 可选捷径；**默认仍走官方 create**（官方前端从不产生客户端自造会话 ID，
+     该模式属非官方行为指纹，反风控优先）
   2. **GET /api/info/general 探活**（cookie + 静态头即可，无签名无浏览器、零副作用）——
      token_monitor 已改造为完全离线
   3. reasoning_content/search_content 的 SSE 语义（解析已支持，待按需透传）

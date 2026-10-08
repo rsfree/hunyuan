@@ -42,6 +42,8 @@ from typing import Optional
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
 
+_BOOT_AT = time.time()   # 进程启动时刻（/admin/version 的 uptime）
+
 # ---------------- 配置 ----------------
 BSK_SESSION = os.environ.get("BSK_SESSION", "")          # 留空自动用当前可达 daemon 会话
 YUANBAO_TAB_ID = os.environ.get("YUANBAO_TAB_ID", "auto")  # agent 窗口里的元宝 tab
@@ -68,6 +70,8 @@ YB_AUTO_DISABLE_AFTER = int(os.environ.get("YB_AUTO_DISABLE_AFTER", "3"))       
 YB_AUTO_REENABLE_AFTER = int(os.environ.get("YB_AUTO_REENABLE_AFTER", "3"))     # 连续成功几次→自动恢复（0=不自动恢复）
 YB_AUTO_EJECT_AFTER_DAYS = int(os.environ.get("YB_AUTO_EJECT_AFTER_DAYS", "0")) # 隔离超几天→自动剔除（0=关闭）
 YB_ROUTER = os.environ.get("YB_ROUTER", "1") == "1"                            # 是否开放 /pool/v1 轮询入口
+# 构建版本（由 update-service.sh 注入 git describe，便于确认"线上跑的是哪个版本"）
+YB_BUILD_VERSION = os.environ.get("YB_BUILD_VERSION", "unknown")
 _WATERMARK: dict = {"at": 0, "ok": None, "enabled": None, "detail": "", "attempts": 0}
 _WM_RUNNING = False
 _KEEPALIVE: dict = {"count": 0, "fail_streak": 0, "at": 0, "ok": None, "status": None, "detail": ""}
@@ -2103,6 +2107,7 @@ async def admin_accounts(req: Request):
     res = await asyncio.gather(*[one(t) for t in targets]) if targets else []
     routable = [x for x in res if (x.get("state") or {}).get("routable")]
     return {"accounts": res, "routable": len(routable), "total": len(res),
+            "build_version": YB_BUILD_VERSION,
             "router_enabled": YB_ROUTER, "router_entry": "/pool/v1",
             "auto": {"disable_after": YB_AUTO_DISABLE_AFTER,
                      "reenable_after": YB_AUTO_REENABLE_AFTER,
@@ -2737,7 +2742,8 @@ async function load() {
       + '<span>自动恢复：连续成功 ≥ <b>' + (a.reenable_after || '关闭') + '</b> 次（仅回滚自动隔离）</span>'
       + '<span>自动剔除：隔离超 <b>' + (a.eject_after_days ? a.eject_after_days + ' 天' : '关闭') + '</b></span>'
       + '<span>轮询入口：<code>' + esc(d.router_entry) + '/…</code> ' + (d.router_enabled ? '<span class="badge ok">已开启</span>' : '<span class="badge warn">已关闭</span>') + '</span>'
-      + '<span>已轮询次数：<b>' + (d.rotation_index || 0) + '</b></span>';
+      + '<span>已轮询次数：<b>' + (d.rotation_index || 0) + '</b></span>'
+      + '<span>版本：<code>' + esc(d.build_version || 'unknown') + '</code></span>';
     render(d.accounts || []);
   } catch (e) { $('list').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
 }
@@ -3106,7 +3112,19 @@ async def admin_whoami(req: Request):
         return cred
     return {"name": os.environ.get("YB_INSTANCE_NAME", "yuanbao-proxy"),
             "base_url": os.environ.get("YB_BASE_URL", ""),
+            "build_version": YB_BUILD_VERSION,
             "mint_backend": YB_MINT_BACKEND, "data_plane": YB_DATA_PLANE}
+
+
+@app.get("/admin/version")
+async def admin_version(req: Request):
+    """线上跑的是哪个版本（无需鉴权，便于部署后一眼确认）。"""
+    import time as _t
+    return {"instance": YB_INSTANCE_NAME_ENV, "build_version": YB_BUILD_VERSION,
+            "uptime_sec": int(_t.time() - _BOOT_AT), "py": os.sys.version.split()[0],
+            "started_at_iso": _t.strftime("%Y-%m-%d %H:%M:%S", _t.localtime(_BOOT_AT)),
+            "stats": bool(METRICS is not None), "state_machine": bool(ACCOUNT is not None),
+            "keepalive_sec": YB_KEEPALIVE_SEC, "router": YB_ROUTER}
 
 
 @app.get("/admin/proxy")

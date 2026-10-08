@@ -243,3 +243,13 @@ hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-
      token_monitor 已改造为完全离线
   3. reasoning_content/search_content 的 SSE 语义（解析已支持，待按需透传）
 - 教训：2024→2026 元宝安全演进 = cookie-only → 静态头 → 签名三件套（chat 强制）
+
+## 15. 代理池接入（数据面反风控）
+
+- 池型：`socks5h://user:pass@pool.livetest.cn:2088`（每请求换出口 IP，实测 .156→.157→.158）
+  与 `:2089`（按目标域名哈希恒定出口，适合会话型流量/浏览器侧备选）
+- 实现：数据面 `_open()` 检测 socks 前缀 → 走 `requests[socks]`（urllib 不支持 socks5）；
+  http/https 代理与直连仍走 urllib。仅连接级错误标坏（HTTP 4xx/5xx 直通），60s 冷却，全冷却直连兜底
+- 凭据纪律：代理 URL 只放服务器 `.env`（compose 用 `${YB_PROXY_POOL:-}` 注入），仓库零凭据
+- 实测：聊天/生图经代理池 200（美区 IP 段对元宝数据面无地理限制）
+- chromium 侧暂直连（`--proxy-server` 不支持 URL 内认证，需 CDP Fetch.authRequired 适配后启用 2089）

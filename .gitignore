@@ -9,3 +9,4 @@ cookie.txt
 deploy/minter_token.txt
 deploy/*/ai-prod/auths/
 cookie.txt
+deploy/**/.env

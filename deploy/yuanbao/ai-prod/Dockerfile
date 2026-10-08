@@ -1,6 +1,6 @@
 FROM mcr.microsoft.com/playwright/python:v1.49.0-jammy
 
-RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.34.0" websocket-client==1.8.0
+RUN pip install --no-cache-dir fastapi==0.115.6 "uvicorn[standard]==0.34.0" websocket-client==1.8.0 "requests[socks]==2.32.3"
 
 WORKDIR /app
 COPY yuanbao_openai_proxy.py cdp_minter.py mint_backends.py ./

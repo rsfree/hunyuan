@@ -21,6 +21,5 @@ services:
       # === 代理池（凭据只放 .env，绝不入库）===
       # 数据面（聊天/生图出站）逐请求轮换出口 IP —— 2088 = 池的"每请求换 IP"端口
       YB_PROXY_POOL: "${YB_PROXY_POOL:-}"
-      # 浏览器侧（铸签/扫码/接码登录）出口：[暂直连]
-      #   如需挂代理用 2089（按域名哈希恒定出口，适合会话型流量）：.env 里加 YB_PROXY_URL=...
-      #   注意：chromium --proxy-server 不支持 URL 内认证，需 CDP Fetch.authRequired 适配后再启用
+      # 浏览器侧（铸签/扫码/接码登录）：经本地 socks 桥走 2089（域名哈希恒定出口，更像真人会话）
+      YB_BROWSER_PROXY: "${YB_BROWSER_PROXY:-}"

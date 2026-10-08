@@ -253,3 +253,10 @@ hy-image 模型别名（chat 门直接生图）：`hy-image / hy-image-3.5 / hy-
 - 凭据纪律：代理 URL 只放服务器 `.env`（compose 用 `${YB_PROXY_POOL:-}` 注入），仓库零凭据
 - 实测：聊天/生图经代理池 200（美区 IP 段对元宝数据面无地理限制）
 - chromium 侧暂直连（`--proxy-server` 不支持 URL 内认证，需 CDP Fetch.authRequired 适配后启用 2089）
+
+### 15.1 浏览器侧接入（socks 桥方案）
+
+chromium `--proxy-server` 不支持 URL 内嵌凭据（socks5 认证无法直传），故引入
+`socks_bridge.py`：本地无认证 socks5（127.0.0.1:1080）→ 上游带认证 `2089`（域名哈希恒定出口）。
+entrypoint 在 `YB_BROWSER_PROXY` 设置时自动起桥并把 chromium 指向它。
+实测：浏览器出口 IP 恒定 `38.6.213.230`（两次请求一致），元宝页面经代理正常加载。

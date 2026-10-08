@@ -5,3 +5,7 @@ __pycache__/
 .DS_Store
 *.log
 Clipboard_Screenshot.png
+cookie.txt
+deploy/minter_token.txt
+deploy/*/ai-prod/auths/
+cookie.txt

@@ -39,7 +39,7 @@ import threading
 from typing import Optional
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse, Response
 
 # ---------------- 配置 ----------------
 BSK_SESSION = os.environ.get("BSK_SESSION", "")          # 留空自动用当前可达 daemon 会话
@@ -51,6 +51,11 @@ YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(�
 YB_DELETE_CONV = os.environ.get("YB_DELETE_CONV", "1")    # 1=生成完自动删除本次创建的会话（历史零残留）
 YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
+YB_MINT_BACKEND = os.environ.get("YB_MINT_BACKEND", "cdp")  # cdp（默认，headless Chrome 铸签，无 bsk）| bsk（遗留）| http（远程 minter）
+YB_COOKIE_FILE = os.environ.get("YB_COOKIE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.txt"))  # 默认凭证文件（无 bsk 数据面）
+YB_DATA_PLANE = os.environ.get("YB_DATA_PLANE", "auto")  # auto|page|cookie：auto=cdp 走页内、bsk 走页内+文件兜底
+YB_MINTER_URL = os.environ.get("YB_MINTER_URL", "")   # 远程 minter 服务（YB_MINT_BACKEND=http 时用）
+YB_MINTER_TOKEN = os.environ.get("YB_MINTER_TOKEN", "")  # minter 服务鉴权（X-Minter-Key）
 YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
 YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙")自动退避重试次数
 PORT = int(os.environ.get("YUANBAO_PROXY_PORT", "8177"))
@@ -152,7 +157,7 @@ _OPENER = _ureq.build_opener(_ureq.ProxyHandler({}))  # 直连，不吃环境代
 
 
 def _yb_headers(cookie: str, sig: Optional[dict], agent_id: str, conv: str = "", extra: Optional[dict] = None) -> dict:
-    h = dict(STATIC_HEADERS)
+    h = {**STATIC_HEADERS, **(_DYN_HEADERS or {})}
     h.update({
         "Cookie": cookie,
         "content-type": "text/plain;charset=UTF-8",
@@ -419,15 +424,38 @@ def _dynamic_fp(tab: str) -> dict:
     return h
 
 
+def _pev(js: str, timeout: int = 300):
+    """页内执行（执行器无关）：cdp 后端走 headless Chromium 的 CDP，bsk 后端走浏览器桥。"""
+    if YB_MINT_BACKEND == "cdp":
+        import cdp_minter
+        return cdp_minter.get_minter().evaluate(js, timeout_s=timeout)
+    ctx = _ensure_page()
+    return _ev(js, tab_id=ctx["tabId"], timeout=timeout)
+
+
+_MINTER = None
+_DYN_HEADERS: Optional[dict] = None
+
+
+def _get_minter():
+    """铸签后端（懒加载单例）。bsk 后端需要主代理模块引用（防循环导入）。"""
+    global _MINTER
+    if _MINTER is None:
+        import sys
+        import mint_backends
+        _MINTER = mint_backends.create_minter(sys.modules[__name__])
+    return _MINTER
+
+
 def get_sig(tab: str, force: bool = False) -> dict:
     """签名三件套缓存复用（TTL 内复用同一套，减少铸签频率；实测可复用）。
-    铸签前注入动态指纹头（UA/webversion/commit-tag 跟随真实页面）。"""
+    铸签后端由 mint_backends 按环境选择：bsk（本机）/ http（远程 minter 服务）/ cdp（服务器自管 Chromium）。"""
     now = time.time()
     if not force and _sig_cache.get("sig") and now - _sig_cache.get("minted_at", 0) < YB_SIG_TTL:
         return _sig_cache["sig"]
-    fp_headers = _dynamic_fp(tab)
-    _ev("window.__ybStaticHeaders = " + json.dumps(fp_headers) + "; 'ok'", tab_id=tab)
-    sig = _mint_only(tab)
+    sig = _get_minter().mint()
+    global _DYN_HEADERS
+    _DYN_HEADERS = _get_minter().headers() or {}
     _sig_cache.clear()
     _sig_cache.update({"sig": sig, "minted_at": now})
     return sig
@@ -908,7 +936,8 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
     """凭证透传模式：数据面全走代理出站 HTTP（签名仍借页面铸造）。
     返回与浏览器路径同构的 result dict。含限速 + 软拒退避重试。
     force_image=True 时（chat 门生图模型）无参考图也走文生图管道。"""
-    ctx = _ensure_page()
+    # cdp 模式无 bsk 页面：agent 取常量；bsk 模式才需 _ensure_page
+    ctx = _ensure_page() if YB_MINT_BACKEND != "cdp" else {"tabId": None, "agentId": "naQivTmsDa"}
     pace("ck:" + cookie[:16])
     with _bsk_lock:
         created_convs = []  # 本次运行创建的会话（结束后统一删除）
@@ -1055,8 +1084,38 @@ def _flatten_messages(messages: list) -> str:
 
 
 # ---------------- OpenAI 端点 ----------------
+@app.get("/login")
+async def login_page(req: Request):
+    """headless 部署模式的扫码入口：返回当前元宝页面的截图（含登录二维码）。需门禁 key。"""
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    try:
+        import base64
+        import cdp_minter
+        m = cdp_minter.get_minter()
+        with m._lock:
+            ws = m._ensure_page()
+            ws.settimeout(30)
+            ws.send(json.dumps({"id": 30, "method": "Page.captureScreenshot", "params": {"format": "png"}}))
+            deadline = time.time() + 25
+            while time.time() < deadline:
+                msg = json.loads(ws.recv())
+                if msg.get("id") == 30:
+                    b64 = msg["result"]["data"]
+                    return Response(content=base64.b64decode(b64), media_type="image/png")
+            return JSONResponse({"error": "截图超时"}, status_code=504)
+    except Exception as e:
+        return JSONResponse({"error": str(e)[:200]}, status_code=502)
+
+
 @app.get("/v1/models")
-async def list_models():
+async def list_models(req: Request):
+    cred = _check_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
     now = int(time.time())
     ids = ["hunyuan", "hunyuan-t1", "deepseek-v3", "deepseek-r1",
            "hy-image", "hy-image-3.5", "hy-image-v3.5", "hy-image-v3.5-preview", "dall-e-3",
@@ -1070,6 +1129,12 @@ async def chat_completions(req: Request):
     if isinstance(cred, JSONResponse):
         return cred
     cookie_str = cred[1] if isinstance(cred, tuple) else None
+    if not cookie_str and (YB_DATA_PLANE == "cookie" or YB_MINT_BACKEND != "cdp") and YB_COOKIE_FILE:
+        try:
+            cookie_str = open(YB_COOKIE_FILE).read().strip() or None
+        except Exception:
+            pass
+    # cdp+auto：无显式 cookie → 页内数据面（需容器页面已登录）；YB_DATA_PLANE=cookie 强制出站+文件凭证
     body = await req.json()
     model_in = body.get("model", "hunyuan")
     chat_model = MODEL_MAP.get(model_in, model_in)  # 未知名字直接透传给元宝
@@ -1100,21 +1165,24 @@ async def chat_completions(req: Request):
     try:
         if cookie_str:
             # ---- 凭证透传模式：客户端 cookie + 页内铸签名，数据面走出站 HTTP ----
-            result = _cookie_mode_run(cookie_str, _ensure_page()["agentId"], prompt,
+            result = _cookie_mode_run(cookie_str, (("naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"])), prompt,
                                       chat_model, image_refs,
                                       _size_to_resolution(body.get("size", "")),
                                       _size_to_ratio(body.get("size", "")),
                                       force_image=_is_image_model(model_in))
 
         else:
-            ctx = _ensure_page()
-            tab = ctx["tabId"]
-            agent = ctx["agentId"]
+            # 浏览器模式：执行器 = bsk（本机）| cdp（服务器 headless Chromium）
+            if YB_MINT_BACKEND == "cdp":
+                tab, agent = None, "naQivTmsDa"
+            else:
+                ctx = _ensure_page()
+                tab, agent = ctx["tabId"], ctx["agentId"]
             with _bsk_lock:
                 if YUANBAO_CONVERSATION:
                     conv = YUANBAO_CONVERSATION
                 elif YB_CREATE_CONV == "1":
-                    conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    conv = _pev(f"({JS_CREATE_CONV})({json.dumps(agent)})", 60)
                     conv_created = conv
                 else:
                     # 可选捷径（YB_CREATE_CONV=0）：客户端 UUID 直当会话 ID，跳过 create；默认关闭（反风控优先）
@@ -1132,14 +1200,14 @@ async def chat_completions(req: Request):
                         if not mime.startswith("image/"):
                             mime = "image/png"
                         ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
-                        entry = _ev(
+                        entry = _pev(
                             f"({JS_UPLOAD_REF})({json.dumps({'b64Data': b64data, 'name': f'ref_{i}.{ext}', 'mime': mime})})",
-                            tab_id=tab, timeout=300,
+                            timeout=300,
                         )
                         multimedia.append(entry)
-                    result = _ev(
+                    result = _pev(
                         f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
-                        tab_id=tab, timeout=300,
+                        timeout=300,
                     )
                 elif unwm:
                     # ---- 去水印：转 data URI → 分块暂存 → /api/image/removewatermark ----
@@ -1149,19 +1217,19 @@ async def chat_completions(req: Request):
                     mime = head[5:].split(";")[0] or "image/png"
                     if not mime.startswith("image/"):
                         mime = "image/png"
-                    _ev("window.__payload = {}; 'ok'", tab_id=tab)
+                    _pev("window.__payload = {}; 'ok'")
                     CHUNK = 100_000
                     n_chunks = (len(b64data) + CHUNK - 1) // CHUNK
                     print(f"[unwm] b64 {len(b64data)//1024}KB -> {n_chunks} chunks", flush=True)
                     for i in range(0, len(b64data), CHUNK):
                         part = b64data[i:i+CHUNK]
                         try:
-                            _ev(f"window.__payload.b64 = (window.__payload.b64||'') + {json.dumps(part)}", tab_id=tab, timeout=60)
+                            _pev(f"window.__payload.b64 = (window.__payload.b64||'') + {json.dumps(part)}", 60)
                             print(f"[unwm] chunk {i//CHUNK + 1}/{n_chunks} ok", flush=True)
                         except Exception as ce:
                             print(f"[unwm] chunk {i//CHUNK + 1}/{n_chunks} FAILED: {str(ce)[:150]}", flush=True)
                             raise
-                    result = _ev(f"({JS_REMOVE_WATERMARK})({json.dumps({})})", tab_id=tab, timeout=180)
+                    result = _pev(f"({JS_REMOVE_WATERMARK})({json.dumps({})})", 180)
                     print(f"[unwm] removewatermark done: ok={result.get('ok')}", flush=True)
                     if result.get("ok") and result.get("urls"):
                         result = {"status": 200, "urls": result["urls"], "wmUrls": result["urls"], "error": None, "raw": None}
@@ -1170,15 +1238,15 @@ async def chat_completions(req: Request):
                         return JSONResponse({"error": {"message": f"去水印（实验性）失败：{reason}", "type": "api_error", "code": "removewatermark_failed"}}, status_code=502)
                 elif image_flow:
                     # ---- chat 门生图模型（hy-image-* 等）：文生图 ----
-                    result = _ev(
+                    result = _pev(
                         f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': _size_to_resolution(body.get('size', '')), 'ratio': _size_to_ratio(body.get('size', '')), 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
-                        tab_id=tab, timeout=300,
+                        timeout=300,
                     )
                 else:
                     # ---- 纯文本聊天 ----
-                    result = _ev(
+                    result = _pev(
                         f"({JS_CHAT})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
-                        tab_id=tab, timeout=300,
+                        timeout=300,
                     )
     except ValueError as e:
         return JSONResponse({"error": {"message": str(e), "type": "invalid_request_error"}}, status_code=400)
@@ -1190,7 +1258,7 @@ async def chat_completions(req: Request):
     # 用完即删（浏览器模式）：历史零残留
     if conv_created:
         try:
-            _ev(f"({JS_DELETE_CONV})({json.dumps({'conv': conv_created})})", tab_id=tab, timeout=30)
+            _pev(f"({JS_DELETE_CONV})({json.dumps({'conv': conv_created})})", 30)
         except Exception:
             pass
 
@@ -1325,6 +1393,12 @@ async def images_generations(req: Request):
     if isinstance(cred, JSONResponse):
         return cred
     cookie_str = cred[1] if isinstance(cred, tuple) else None
+    if not cookie_str and (YB_DATA_PLANE == "cookie" or YB_MINT_BACKEND != "cdp") and YB_COOKIE_FILE:
+        try:
+            cookie_str = open(YB_COOKIE_FILE).read().strip() or None
+        except Exception:
+            pass
+    # cdp+auto：无显式 cookie → 页内数据面（需容器页面已登录）；YB_DATA_PLANE=cookie 强制出站+文件凭证
     body = await req.json()
     prompt = (body.get("prompt") or "").strip()
     if not prompt:
@@ -1347,19 +1421,22 @@ async def images_generations(req: Request):
     conv_created = None
     try:
         if cookie_str:
-            result = _cookie_mode_run(cookie_str, _ensure_page()["agentId"], prompt,
+            result = _cookie_mode_run(cookie_str, (("naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"])), prompt,
                                       chat_model, image_refs, resolution,
                                       _size_to_ratio(body.get("size", "")))
 
         else:
-            ctx = _ensure_page()
-            tab = ctx["tabId"]
-            agent = ctx["agentId"]
+            # 浏览器模式：执行器 = bsk（本机）| cdp（服务器 headless Chromium）
+            if YB_MINT_BACKEND == "cdp":
+                tab, agent = None, "naQivTmsDa"
+            else:
+                ctx = _ensure_page()
+                tab, agent = ctx["tabId"], ctx["agentId"]
             with _bsk_lock:
                 if YUANBAO_CONVERSATION:
                     conv = YUANBAO_CONVERSATION
                 elif YB_CREATE_CONV == "1":
-                    conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    conv = _pev(f"({JS_CREATE_CONV})({json.dumps(agent)})", 60)
                     conv_created = conv
                 else:
                     # 可选捷径（YB_CREATE_CONV=0）：客户端 UUID 直当会话 ID，跳过 create；默认关闭（反风控优先）
@@ -1377,19 +1454,19 @@ async def images_generations(req: Request):
                         if not mime.startswith("image/"):
                             mime = "image/png"
                         ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
-                        entry = _ev(
+                        entry = _pev(
                             f"({JS_UPLOAD_REF})({json.dumps({'b64Data': b64data, 'name': f'ref_{i}.{ext}', 'mime': mime})})",
-                            tab_id=tab, timeout=300,
+                            timeout=300,
                         )
                         multimedia.append(entry)
-                    result = _ev(
+                    result = _pev(
                         f"({JS_CHAT_I2I})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'multimedia': multimedia, 'resolution': resolution, 'ratio': _size_to_ratio(body.get('size', '')), 'chatModelId': chat_model, 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
-                        tab_id=tab, timeout=300,
+                        timeout=300,
                     )
                 else:
-                    result = _ev(
+                    result = _pev(
                         f"({JS_IMAGE})({json.dumps({'conv': conv, 'agentId': agent, 'prompt': prompt, 'resolution': resolution, 'ratio': _size_to_ratio(body.get('size', '')), 'temp': YUANBAO_TEMP_CONV == '1', 'sig': sig})})",
-                        tab_id=tab, timeout=300,
+                        timeout=300,
                     )
     except Exception as e:
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
@@ -1397,7 +1474,7 @@ async def images_generations(req: Request):
     # 用完即删（浏览器模式）：历史零残留
     if conv_created:
         try:
-            _ev(f"({JS_DELETE_CONV})({json.dumps({'conv': conv_created})})", tab_id=tab, timeout=30)
+            _pev(f"({JS_DELETE_CONV})({json.dumps({'conv': conv_created})})", 30)
         except Exception:
             pass
 
@@ -1425,4 +1502,4 @@ async def images_generations(req: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=PORT, log_level="info")
+    uvicorn.run(app, host=os.environ.get("YB_BIND", "127.0.0.1"), port=PORT, log_level="info")

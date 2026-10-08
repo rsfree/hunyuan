@@ -1,0 +1,17 @@
+services:
+  yuanbao-proxy:
+    build: .
+    container_name: yuanbao-proxy
+    restart: unless-stopped
+    shm_size: 1g
+    ports:
+      - "127.0.0.1:39177:39177"        # 只绑回环，公网入口走 nginx
+    volumes:
+      - ./auths/cookie.txt:/auths/cookie.txt:ro
+      - ./auths/chrome-profile:/data/chrome-profile   # 持久化浏览器 profile（登录态）
+    environment:
+      YUANBAO_API_KEY: "${YUANBAO_API_KEY}"
+      YB_MINT_BACKEND: "cdp"
+      YB_DATA_PLANE: "cookie"
+      CDP_HTTP: "http://127.0.0.1:9222"   # 同容器 loopback（多 worker 共享）
+      YB_WORKERS: "4"

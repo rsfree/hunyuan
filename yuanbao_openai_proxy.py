@@ -915,13 +915,8 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
             if YUANBAO_CONVERSATION:
                 conv = YUANBAO_CONVERSATION
             else:
-                r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
-                                  {"agentId": agent_id}, sig, agent_id)
-                if r["status"] == 401:
-                    return {"status": 401, "text": r["text"]}
-                conv = json.loads(r["text"]).get("id")
-                if not conv:
-                    raise RuntimeError("创建会话失败: " + r["text"][:150])
+                # 借鉴旧版 MeUtils：客户端 UUID 直当会话，跳过 create
+                conv = str(uuid.uuid4())
                 created_convs.append(conv)
             if image_refs or force_image:
                 multimedia = []
@@ -1108,7 +1103,8 @@ async def chat_completions(req: Request):
                 if YUANBAO_CONVERSATION:
                     conv = YUANBAO_CONVERSATION
                 else:
-                    conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    # 借鉴旧版 MeUtils：客户端自造 UUID 直当会话 ID，跳过 create 调用
+                    conv = str(uuid.uuid4())
                     conv_created = conv
                 sig = get_sig(tab)
                 if image_refs and not unwm:
@@ -1348,7 +1344,8 @@ async def images_generations(req: Request):
                 if YUANBAO_CONVERSATION:
                     conv = YUANBAO_CONVERSATION
                 else:
-                    conv = _ev(f"({JS_CREATE_CONV})({json.dumps(agent)})", tab_id=tab)
+                    # 借鉴旧版 MeUtils：客户端自造 UUID 直当会话 ID，跳过 create 调用
+                    conv = str(uuid.uuid4())
                     conv_created = conv
                 sig = get_sig(tab)
                 if image_refs and not unwm:

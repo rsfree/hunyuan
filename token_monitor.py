@@ -2,7 +2,8 @@
 """
 token_monitor.py — 元宝最小凭证（hy_token+hy_user）存活监控
 
-每 CHECK_INTERVAL 秒用最小 cookie 调一次 conversation/create：
+每 CHECK_INTERVAL 秒用最小 cookie + 静态头 GET /api/info/general 探活（零副作用、
+无需签名、无需浏览器）：
   200 → 存活；401 → 过期告警（写日志 + macOS 通知）。
 
 用法：python3 token_monitor.py &   （或 nohup 挂后台）
@@ -91,13 +92,12 @@ def mint_trio():
     return json.loads(o[o.index("{"):])["value"]
 
 
-def check(cookie, sig):
+def check(cookie):
+    """探活：GET /api/info/general（静态头即可，无签名 → 完全去浏览器）"""
     headers = dict(STATIC)
     headers["Cookie"] = cookie
-    headers.update({"X-Uskey": sig["uskey"], "X-Bus-Params-Md5": sig["md5"], "X-Timestamp": sig["ts"]})
-    req = urllib.request.Request(
-        "https://yuanbao.tencent.com/api/user/agent/conversation/create",
-        data=json.dumps({"agentId": AGENT_ID}).encode(), headers=headers, method="POST")
+    req = urllib.request.Request("https://yuanbao.tencent.com/api/info/general",
+                                 headers=headers, method="GET")
     try:
         with OPENER.open(req, timeout=30) as r:
             return r.status, r.read().decode()[:80]
@@ -115,8 +115,7 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
             cookie = open(COOKIE_FILE).read().strip()
-            sig = mint_trio()
-            st, body = check(cookie, sig)
+            st, body = check(cookie)
             if st == 200:
                 if last_status == 401:
                     log("凭证恢复 ✓（文件已更新？）")

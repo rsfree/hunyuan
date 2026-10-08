@@ -131,6 +131,45 @@ _UNUSED_FP_JS = """
 """
 
 
+# 登录页截图裁剪：找出"含微信二维码的最内层容器"。
+# 实测 DOM：二维码在 iframe(open.weixin.qq.com/connect/qrconnect, 200x400) 里，
+# 其最内层容器是 .hyc-login__content(460x440)；同层的 .hyc-login__left(240x440) 是推广面板，
+# 所以不能只按"面积最小"选 —— 必须加"矩形要包含二维码中心点"这一约束。
+CLIP_JS = """
+(() => {
+  const ifrs = Array.prototype.slice.call(document.querySelectorAll('iframe')).filter(function (f) {
+    const s = f.getAttribute('src') || '';
+    return s.indexOf('qrconnect') >= 0 || s.indexOf('open.weixin') >= 0;
+  });
+  let qr = null;
+  for (const f of ifrs) { const r = f.getBoundingClientRect(); if (r.width > 50 && r.height > 50) { qr = r; break; } }
+  const sels = ['.hyc-login-v2', '.hyc-phone-login', '[class*=hyc-login]', '.t-dialog', '[role=dialog]',
+                '[class*=login-modal]', '[class*=login-dialog]', '[class*=login-box]', '[class*=login-wrap]'];
+  const cands = [];
+  for (const s of sels) document.querySelectorAll(s).forEach(function (e) { cands.push(e); });
+  if (ifrs.length) { let q = ifrs[0].parentElement; while (q && q !== document.body) { cands.push(q); q = q.parentElement; } }
+  const cx = qr ? (qr.x + qr.width / 2) : null;
+  const cy = qr ? (qr.y + qr.height / 2) : null;
+  const minW = 380;
+  let best = null;
+  for (const el of cands) {
+    const r = el.getBoundingClientRect();
+    if (r.width < minW || r.height < 240) continue;
+    if (r.width > window.innerWidth * 0.96 || r.height > window.innerHeight * 0.96) continue;
+    if (cx !== null && (cx < r.x || cx > r.x + r.width || cy < r.y || cy > r.y + r.height)) continue;
+    const a = r.width * r.height;
+    if (!best || a < best.a) best = { a: a, r: r };
+  }
+  if (!best) { if (!qr) return null; best = { a: 0, r: qr }; }
+  const p = 20, r = best.r;
+  const x = Math.max(0, r.x - p), y = Math.max(0, r.y - p);
+  return { x: x, y: y,
+           width: Math.min(r.width + p * 2, window.innerWidth - x),
+           height: Math.min(r.height + p * 2, window.innerHeight - y) };
+})()
+"""
+
+
 class CDPMinter:
     def __init__(self):
         self._lock = threading.Lock()
@@ -203,7 +242,12 @@ class CDPMinter:
         ws.send(json.dumps({"id": mid, "method": method, "params": params or {}}))
         deadline = time.time() + 60
         while time.time() < deadline:
-            msg = json.loads(ws.recv())
+            # 短轮询：recv 若按 socket 超时（180s）阻塞，下面的 deadline 形同虚设
+            ws.settimeout(max(1.0, min(10.0, deadline - time.time())))
+            try:
+                msg = json.loads(ws.recv())
+            except websocket.WebSocketTimeoutException:
+                continue
             if msg.get("id") == mid:
                 return msg.get("result", {})
         raise TimeoutError(method)
@@ -247,7 +291,21 @@ class CDPMinter:
             raise RuntimeError("createTarget 失败: " + json.dumps(r)[:200])
         time.sleep(1)
         targets = self._http_json("/json/list")
-        page = next(t for t in targets if t["type"] == "page" and t["url"] == "about:blank")
+        # 精确按 targetId 取"刚创建的那个"：
+        # 旧写法 next(... url=="about:blank") 会命中 entrypoint 启动时那个常驻 about:blank，
+        # 于是刚建的 target 永不回收 —— 多次 /login 后堆积出多个重复元宝标签页
+        # （实测 4 worker 各建一页 → /json/list 里 3 个 /chat/naQivTmsDa + 1 个 /chat）。
+        page = next((t for t in targets if t.get("id") == tid), None)
+        if page is None:
+            page = next(t for t in targets if t["type"] == "page" and t["url"] == "about:blank")
+        # 顺手清理同类残留页（保留当前这一个），避免 stack 越滚越大
+        for t in targets:
+            if (t.get("type") == "page" and t.get("id") != page.get("id")
+                    and "yuanbao.tencent.com" in (t.get("url") or "")):
+                try:
+                    self._http_json("/json/close/" + t["id"], timeout=3)
+                except Exception:
+                    pass
         if self._page_ws:
             try:
                 self._page_ws.close()
@@ -263,6 +321,7 @@ class CDPMinter:
         self._ws_send(self._page_ws, "Page.addScriptToEvaluateOnNewDocument",
                       {"source": STEALTH_JS}, mid=905)
         self._ws_send(self._page_ws, "Page.enable", mid=906)
+        self._ws_send(self._page_ws, "Network.enable", mid=908)   # 供 extract_cookies 用（保活探针）
         self._ws_send(self._page_ws, "Page.navigate", {"url": CDP_YB_URL}, mid=907)
         time.sleep(3)
         # 等应用 chunk 就绪
@@ -324,18 +383,132 @@ class CDPMinter:
         """页内执行 JS 并返回值（浏览器模式数据面通道）。"""
         with self._lock:
             ws = self._ensure_page()
+            return self._eval_on(ws, js, timeout_s, mid=20)
+
+    # ---- 登录页：点击切换 + 截图（必须全程持锁，见下方注释） ----
+    def _eval_on(self, ws, js: str, timeout_s: int = 30, mid: int = 25):
+        """在**已持锁**的 ws 上执行 JS（不再抢锁，否则死锁）。
+
+        🔴 每条 CDP 会话必须带唯一 id 并读到自己的回包：_ensure_page 的存活探针用 id=1，
+        evaluate 用 id=20。两个线程若在同一 ws 上交错 send/recv，会互相"偷"到对方的回包，
+        各自永远等不到自己的 id → 卡到超时（实测表现为 /login 永久 hang + 502）。
+        故所有 CDP 会话一律在 self._lock 内串行化。
+        """
+        ws.settimeout(timeout_s)
+        ws.send(json.dumps({"id": mid, "method": "Runtime.evaluate",
+                            "params": {"expression": js, "returnByValue": True, "awaitPromise": True}}))
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            msg = json.loads(ws.recv())
+            if msg.get("id") == mid:
+                res = msg.get("result", {})
+                if res.get("exceptionDetails"):
+                    raise RuntimeError("页内执行失败: " + json.dumps(res["exceptionDetails"], ensure_ascii=False)[:200])
+                return res.get("result", {}).get("value")
+        raise TimeoutError("eval 超时")
+
+    def screenshot(self, tab: str = None, timeout_s: int = 60) -> bytes:
+        """登录页截图：可选先切到 wechat/phone 登录方式。整段（切页 + 截图）持同一把锁，
+        对外是一个原子 CDP 会话 —— 上层只需 asyncio.to_thread(m.screenshot, tab)。"""
+        import base64
+        with self._lock:
+            ws = self._ensure_page()
+            if tab in ("wechat", "phone"):
+                names = "['微信','WeChat']" if tab == "wechat" else "['手机','Phone']"
+                self._eval_on(ws, (
+                    "(() => { const b=[...document.querySelectorAll('*')]"
+                    ".filter(e=>e.offsetWidth>0&&e.children.length<=2"
+                    "&&['登录','Log In'].includes((e.textContent||'').trim()))"
+                    ".sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0];"
+                    " if(b && !document.querySelector('.hyc-login-v2,.hyc-phone-login')) b.click(); return 'ok'; })()"
+                ), 30, mid=31)
+                self._eval_on(ws, (
+                    f"(() => {{ const c=[...document.querySelectorAll('*')]"
+                    f".filter(e=>e.offsetWidth>0&&e.children.length<=2&&{names}.includes((e.textContent||'').trim()))"
+                    f".sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0];"
+                    f" if(c) c.click(); return 'ok'; }})()"
+                ), 30, mid=32)
+                time.sleep(2)
             ws.settimeout(timeout_s)
-            ws.send(json.dumps({"id": 20, "method": "Runtime.evaluate",
-                                "params": {"expression": js, "returnByValue": True, "awaitPromise": True}}))
+            # 尽量只截"登录弹窗"区域并放大 2x：整页截图里二维码太小，手机扫不出来
+            params = {"format": "png"}
+            try:
+                clip = self._eval_on(ws, CLIP_JS, 15, mid=33)
+                if clip:
+                    params["clip"] = {"x": clip["x"], "y": clip["y"],
+                                      "width": clip["width"], "height": clip["height"], "scale": 2}
+            except Exception:
+                pass
+            ws.settimeout(timeout_s)
+            ws.send(json.dumps({"id": 40, "method": "Page.captureScreenshot", "params": params}))
             deadline = time.time() + timeout_s
             while time.time() < deadline:
                 msg = json.loads(ws.recv())
-                if msg.get("id") == 20:
-                    res = msg.get("result", {})
-                    if res.get("exceptionDetails"):
-                        raise RuntimeError("页内执行失败: " + json.dumps(res["exceptionDetails"], ensure_ascii=False)[:200])
-                    return res.get("result", {}).get("value")
-            raise TimeoutError("evaluate 超时")
+                if msg.get("id") == 40:
+                    return base64.b64decode(msg["result"]["data"])
+        raise TimeoutError("截图超时")
+
+    # ---- 登录态管理（给管理页/扫码页用） ----
+    def extract_cookies(self, domain: str = "yuanbao.tencent.com") -> str:
+        """取出该域的 cookie 并拼成 Cookie 头。
+
+        用途：**脱离页面**做轻量保活/探活（GET /api/info/general 只需 cookie + 静态头，
+        无需签名、无需页面）—— 探活的 HTTP 往返不占 CDP 锁，不干扰正在进行的对话。
+        """
+        with self._lock:
+            ws = self._ensure_page()
+            r = self._ws_send(ws, "Network.getCookies",
+                              {"urls": ["https://" + domain + "/"]}, mid=45)
+            cks = (r or {}).get("cookies") or []
+            return "; ".join(f"{c['name']}={c['value']}" for c in cks if c.get("name"))
+
+    def page_state(self) -> dict:
+        """轻量页面状态：是否已登录 / 是否被冻结。给管理页做状态提示用。"""
+        try:
+            with self._lock:
+                ws = self._ensure_page()
+                return self._eval_on(ws, (
+                    "(() => { const t = document.body.innerText || '';"
+                    " return { url: location.href, title: document.title,"
+                    "          frozen: t.indexOf('账号已冻结') >= 0,"
+                    "          logged_in: document.cookie.indexOf('hy_user') >= 0,"
+                    "          text: t.slice(0, 120) }; })()"
+                ), 20, mid=34) or {}
+        except Exception as e:
+            return {"error": str(e)[:120]}
+
+    def reset_login(self) -> dict:
+        """重置登录态：清浏览器 cookie + localStorage（**保留设备种子 _qimei_h38**）+ 重载页面。
+
+        账号被冻结 / 要换账号登录时必须先做这一步：冻结态页面没有"登录"按钮，
+        不清会话就没法扫码或接码登入新账号。保留设备种子是为了不换指纹（换指纹更易触发风控）。
+        """
+        with self._lock:
+            ws = self._ensure_page()
+            self._ws_send(ws, "Network.enable", {}, mid=51)
+            self._ws_send(ws, "Network.clearBrowserCookies", {}, mid=52)
+            self._eval_on(ws, (
+                "(() => { const k = localStorage.getItem('_qimei_h38');"
+                " localStorage.clear(); if (k) localStorage.setItem('_qimei_h38', k);"
+                " return 'ok'; })()"
+            ), 20, mid=53)
+            try:
+                self._ws_send(ws, "Page.navigate", {"url": CDP_YB_URL}, mid=54)
+            except Exception:
+                pass
+            time.sleep(4)
+            for _ in range(60):
+                try:
+                    r = self._ws_send(ws, "Runtime.evaluate",
+                                      {"expression": "document.readyState === 'complete'",
+                                       "returnByValue": True}, mid=55)
+                except Exception:
+                    break
+                if r.get("result", {}).get("value"):
+                    break
+                time.sleep(1)
+            time.sleep(3)
+            return {"ok": True}
 
     def healthz(self):
         return {"warm": self._warm}

@@ -82,6 +82,8 @@ update_one() {
   fi
   export YB_BUILD_VERSION="$build_ver"
   log "构建版本：$build_ver"
+# 共享网络：跨实例的管理/聚合都靠它
+docker network inspect yuanbao-net >/dev/null 2>&1 || docker network create yuanbao-net >/dev/null
 
   log "构建镜像 ..."
   # shellcheck disable=SC2086

@@ -47,7 +47,7 @@ class AccountState:
     def _default(self):
         return {"name": self.name, "state": "enabled", "reason": "初始状态",
                 "changed_at": int(time.time()), "changed_by": "init",
-                "fail_streak": 0, "ok_streak": 0,
+                "fail_streak": 0, "ok_streak": 0, "ever_ok": False,
                 "last_health": None, "history": []}
 
     def _load(self):
@@ -58,6 +58,10 @@ class AccountState:
                 d["state"] = "enabled"
             for k in ("fail_streak", "ok_streak"):
                 d.setdefault(k, 0)
+            d.setdefault("ever_ok", False)
+            # 兼容旧文件：已有成功健康记录 ⇒ 视为曾可用
+            if (d.get("last_health") or {}).get("ok"):
+                d["ever_ok"] = True
             d.setdefault("history", [])
             return d
         except Exception:
@@ -121,6 +125,16 @@ class AccountState:
         with self._lock:
             self._d["last_health"] = {"at": int(time.time()), "ok": bool(ok), "status": status,
                                       "detail": detail[:200], "frozen": bool(frozen)}
+            if ok:
+                self._d["ever_ok"] = True
+            elif not self._d.get("ever_ok"):
+                # 🔴 从未成功过（＝还没扫码登录过的新实例）不计失败、不自动隔离。
+                # 否则刚 add-account 出来的号会在 3 个保活周期后被误隔离，反而更难上手。
+                self._save()
+                d = json.loads(json.dumps(self._d))
+                d["label"] = LABELS.get(d["state"], d["state"])
+                d["routable"] = d["state"] == "enabled"
+                return d, None
             if ok:
                 self._d["ok_streak"] = self._d.get("ok_streak", 0) + 1
                 self._d["fail_streak"] = 0

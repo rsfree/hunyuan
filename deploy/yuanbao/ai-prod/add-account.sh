@@ -28,6 +28,8 @@ err() { printf '\033[1;31m[add]\033[0m %s\n' "$*" >&2; }
 [ -n "$NAME" ] && [ -n "$PORT" ] || { err "用法: $0 <实例名> <端口> [域名]"; exit 1; }
 case "$NAME" in acc*) ;; *) err "实例名建议用 accNN（如 acc02）"; exit 1;; esac
 [ -d "$ROOT" ] || { err "找不到 $ROOT"; exit 1; }
+# 共享网络：跨实例的管理/聚合都靠它
+docker network inspect yuanbao-net >/dev/null 2>&1 || docker network create yuanbao-net >/dev/null
 cd "$ROOT"
 
 ENVF=".env.$NAME"
@@ -51,6 +53,7 @@ log "从 $src 继承共享配置（代理池 / fleet key / 保活间隔）"
   echo "YB_INSTANCE_NAME=$NAME"
   echo "YB_PORT=$PORT"
   echo "YB_BASE_URL=${DOMAIN:+https://$DOMAIN}"
+  echo "YB_POOL_PEERS=$(sed -n 's/^YB_POOL_PEERS=//p' "$src" | tail -1)"
   echo "YB_DATA_PLANE=page"
   echo "YB_WORKERS=1"
 } > "$ENVF"
@@ -66,8 +69,10 @@ for f in .env .env.*; do
   if [ -n "$DOMAIN" ]; then
     new="$cur,$NAME=https://$DOMAIN"
   else
-    new="$cur"
+    # 没配公网域名也能入池：走共享 docker 网络的容器名（内部聚合/管理/转发够用）
+    new="$cur,$NAME=http://yuanbao-$NAME:39177"
   fi
+  new="${new#,}"
   python3 - "$f" "$new" <<'PY'
 import sys
 p, v = sys.argv[1], sys.argv[2]

@@ -347,9 +347,30 @@ def _record_keepalive(r: dict) -> dict:
     return _KEEPALIVE
 
 
+async def _keepalive_probe_now():
+    """立刻做一次保活并把结果落进状态机（供 /admin/state 触发，避免新号等一个周期）。"""
+    try:
+        r = await _keepalive_once()
+        snap = _record_keepalive(r)
+        if ACCOUNT is not None:
+            import cdp_minter
+            frozen = False
+            try:
+                stt = await asyncio.to_thread(cdp_minter.get_minter().page_state)
+                frozen = bool(stt.get("frozen"))
+            except Exception:
+                pass
+            ACCOUNT.record_health(bool(r.get("ok")), r.get("status"), r.get("detail", ""), frozen)
+        print("[keepalive] 按需触发 ok=%s %s" % (r.get("ok"), r.get("detail", "")[:80]), flush=True)
+        return snap
+    except Exception as e:
+        print("[keepalive] 按需触发失败: %s" % str(e)[:120], flush=True)
+        return None
+
+
 async def _keepalive_loop():
     """进程内定时保活。页面数据面必须单 worker，故这里只有一份循环（不会 N 份叠加）。"""
-    await asyncio.sleep(60)  # 启动后先等页面预热/首次使用
+    await asyncio.sleep(15)  # 启动后先等页面预热/首次使用
     while True:
         try:
             r = await _keepalive_once()
@@ -1572,7 +1593,7 @@ def _screenshot_png(m):
 async def login_page(req: Request):
     """headless 部署模式的扫码入口：返回当前元宝页面的截图（含登录二维码）。需门禁 key。
     支持 ?tab=wechat|phone 先切换到对应登录方式（wechat 会刷新二维码）。"""
-    cred = _check_auth(req)
+    cred = _check_admin_panel_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
     if YB_MINT_BACKEND != "cdp":
@@ -1693,7 +1714,7 @@ JS_PHONE_VERIFY = """
 @app.post("/login/phone/send")
 async def login_phone_send(req: Request):
     """香港/大陆手机号接码登录 —— 第一步：切区号 + 填号 + 点发送验证码。"""
-    cred = _check_auth(req)
+    cred = _check_admin_panel_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
     if YB_MINT_BACKEND != "cdp":
@@ -1720,7 +1741,7 @@ async def login_phone_send(req: Request):
 @app.post("/login/phone/verify")
 async def login_phone_verify(req: Request):
     """接码登录 —— 第二步：填验证码 + 提交，成功即持久化到容器 profile。"""
-    cred = _check_auth(req)
+    cred = _check_admin_panel_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
     if YB_MINT_BACKEND != "cdp":
@@ -1757,6 +1778,11 @@ async def admin_state(req: Request):
     if (YB_AUTO_WATERMARK and st.get("logged_in") and not st.get("frozen")
             and not _WM_RUNNING and time.time() - _WATERMARK.get("at", 0) > 60):
         asyncio.create_task(_watermark_auto())
+    # 已登录但还没有过成功保活 → 立刻补一次，使该号尽快具备被轮询的资格
+    if (st.get("logged_in") and not st.get("frozen") and ACCOUNT is not None
+            and not (ACCOUNT.get().get("last_health") or {}).get("ok")
+            and time.time() - _KEEPALIVE.get("at", 0) > 20):
+        asyncio.create_task(_keepalive_probe_now())
     return {"result": st, "keepalive": _KEEPALIVE, "watermark": _WATERMARK}
 
 
@@ -1846,8 +1872,15 @@ async def admin_pool(req: Request):
 
 # ---------------- 统计 & 号池批量运维 ----------------
 def _fleet_peers_all():
-    """所有实例（含自己），self 标记自身 —— 批量操作与汇总统计的目标集合。"""
-    out = [{**pp, "self": pp["url"].rstrip("/") == YB_BASE_URL_ENV} for pp in _pool_peers()]
+    """所有实例（含自己），self 标记自身 —— 批量操作与汇总统计的目标集合。
+
+    自身识别**按名字优先**（peer 之间常用容器名/内网地址互通，此时与 YB_BASE_URL 不相等），
+    URL 比对只作兜底。
+    """
+    def _is_self(pp):
+        return (pp.get("name") == YB_INSTANCE_NAME_ENV
+                or (YB_BASE_URL_ENV and pp["url"].rstrip("/") == YB_BASE_URL_ENV))
+    out = [{**pp, "self": _is_self(pp)} for pp in _pool_peers()]
     if YB_BASE_URL_ENV and not any(x["self"] for x in out):
         out.insert(0, {"id": "self", "name": YB_INSTANCE_NAME_ENV, "url": YB_BASE_URL_ENV, "self": True})
     return out
@@ -2013,18 +2046,30 @@ def _peer_state_cached(url: str, ttl: int = 30):
     return st
 
 
+def _router_ok(st: dict) -> bool:
+    """路由门禁：**必须 enabled 且最近一次保活成功**。
+
+    只判 routable 是不够的 —— 刚 add-account 出来、还没扫码登录的实例也是 enabled，
+    但把它算进轮询只会把用户请求打到一个用不了的号上。所以要求"健康被证实过"。
+    新号登录后 /admin/state 会立刻触发一次保活（见下），约 20s 内即可参与轮询。
+    """
+    if not st or not st.get("routable"):
+        return False
+    h = st.get("last_health") or {}
+    return h.get("ok") is True
+
+
 def _router_targets():
-    """可参与轮询的实例：自己 + 各 peer 中 state=enabled 且最近健康非 False。"""
+    """可参与轮询的实例：自己 + 各 peer（严格按 _router_ok 判定）。"""
     out = []
     for t in _fleet_peers_all():
         if t.get("self"):
             st = ACCOUNT.get() if ACCOUNT else {"state": "enabled", "routable": True, "last_health": None}
-            h = st.get("last_health") or {}
-            if st.get("routable") and h.get("ok") is not False:
+            if _router_ok(st):
                 out.append({**t, "state": st, "key": YUANBAO_API_KEY})
         else:
             st = _peer_state_cached(t["url"])
-            if st and st.get("routable"):
+            if _router_ok(st):
                 out.append({**t, "state": st})
     return out
 
@@ -2115,6 +2160,82 @@ async def admin_accounts(req: Request):
             "rotation_index": _ROT_IDX}
 
 
+@app.api_route("/pool/peer/{name}/{path:path}", methods=["GET", "POST"])
+async def pool_peer_proxy(req: Request, name: str, path: str):
+    """**跨实例管理代理**：通过本实例的域名访问 peer 的管理端点与页面。
+
+    用途：多号时不必给每个号都配公网域名 —— 一个入口就能打开任意号的扫码页 / 管理页 / 截图。
+    🔴 只按**名字**从 YB_POOL_PEERS 里查目标，**绝不接受 URL**（防 SSRF）。
+
+    对 HTML 响应会注入一段 fetch/XHR 前缀垫片，使被代理页面里的绝对路径请求
+    （如 `/login?tab=wechat`、`/admin/state`）自动指回该 peer，从而页面在代理下也能正常工作。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    t = next((x for x in _pool_peers() if x.get("name") == name), None)
+    if not t:
+        return JSONResponse({"error": "未知实例：%s" % name}, status_code=404)
+    import requests
+    upstream = t["url"].rstrip("/") + "/" + path.lstrip("/")
+    if req.url.query:
+        upstream += "?" + req.url.query
+    hdr = {"Authorization": "Bearer " + (YB_FLEET_KEY or YUANBAO_API_KEY)}
+    ct = req.headers.get("content-type")
+    if ct:
+        hdr["content-type"] = ct
+    body = await req.body()
+    try:
+        up = await asyncio.to_thread(
+            lambda: requests.request(req.method, upstream, data=(body or None),
+                                     headers=hdr, stream=True, timeout=(15, 300)))
+    except Exception as e:
+        return JSONResponse({"error": "%s: %s" % (type(e).__name__, str(e)[:140])}, status_code=502)
+
+    up_ct = (up.headers.get("content-type") or "").lower()
+    base = "/pool/peer/" + name
+    if "text/html" in up_ct:
+        html = up.content.decode("utf-8", "ignore")
+        # 垫片：把页面里所有「站内绝对路径」请求改写到该 peer 前缀。
+        # 覆盖三处：fetch、XHR、以及**img.src 直接赋值**（后者不走前两个，
+        # 漏了会导致二维码图片仍从本实例取 —— 实测过，别删）。
+        shim = ("<script>(function(){var P=" + json.dumps(base) + ";"
+                "function fix(v){try{if(typeof v==='string'&&v.charAt(0)==='/'&&v.indexOf(P)!==0)return P+v;}"
+                "catch(e){}return v;}"
+                "var f=window.fetch;window.fetch=function(u,o){return f.call(this,fix(u),o);};"
+                "var X=window.XMLHttpRequest.prototype.open;"
+                "window.XMLHttpRequest.prototype.open=function(m,u){return X.apply(this,[m,fix(u)].concat("
+                "[].slice.call(arguments,2)));};"
+                "try{var d=Object.getOwnPropertyDescriptor(HTMLImageElement.prototype,'src');"
+                "Object.defineProperty(HTMLImageElement.prototype,'src',{get:d.get,"
+                "set:function(v){return d.set.call(this,fix(v));}});}catch(e){}"
+                "try{new MutationObserver(function(ms){ms.forEach(function(m){"
+                "if(m.type==='attributes'&&m.target&&m.target.getAttribute){"
+                "var s=m.target.getAttribute('src');"
+                "if(s&&s.charAt(0)==='/'&&s.indexOf(P)!==0)m.target.setAttribute('src',P+s);}});})"
+                ".observe(document.documentElement,{subtree:true,attributes:true,attributeFilter:['src']});}catch(e){}"
+                "})();</script>")
+        html = html.replace("<body>", "<body>" + shim, 1)
+        up.close()
+        return Response(content=html, status_code=up.status_code,
+                        media_type="text/html; charset=utf-8", headers={"X-YB-Peer": name})
+
+    def gen(resp=up):
+        try:
+            for chunk in resp.iter_content(chunk_size=16384):
+                if chunk:
+                    yield chunk
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+    return StreamingResponse(gen(), status_code=up.status_code,
+                             media_type=up.headers.get("content-type", "application/json"),
+                             headers={"X-YB-Peer": name})
+
+
 @app.api_route("/pool/v1/{rest:path}", methods=["GET", "POST"])
 async def pool_router(req: Request, rest: str):
     """**轮询入口**：/pool/v1/<rest> 轮询分发到各可用账号，失败自动切下一个。
@@ -2183,7 +2304,7 @@ async def pool_router(req: Request, rest: str):
 @app.post("/login/reset")
 async def login_reset(req: Request):
     """重置登录态：清 cookie + localStorage（保留设备种子）后重载页面 —— 换账号登录前必做。"""
-    cred = _check_auth(req)
+    cred = _check_admin_panel_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
     if YB_MINT_BACKEND != "cdp":
@@ -2770,6 +2891,7 @@ function render(accs) {
       + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'disable\\')">禁用</button>'
       + '<button class="danger" onclick="act(\\'' + name + '\\',\\'eject\\')">剔除</button>'
       + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'reset\\')">重置</button>'
+      + '<button class="ghost" onclick="openQr(\\'' + name + '\\')">扫码</button>'
       + '</div></td>';
     h += '</tr>';
     for (const ev of (st.history || []).slice(-6).reverse()) {
@@ -2788,6 +2910,10 @@ function render(accs) {
     });
     $('hist').innerHTML = t + '</table>';
   }
+}
+
+function openQr(name) {
+  window.open('/pool/peer/' + encodeURIComponent(name) + '/qr?k=' + encodeURIComponent(KEY), '_blank');
 }
 
 async function act(name, action) {

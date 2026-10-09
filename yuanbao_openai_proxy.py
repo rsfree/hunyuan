@@ -400,6 +400,19 @@ async def _keepalive_loop():
             # 新号登录后自动开启"无水印保存"（幂等：已是开启态则不写）
             if YB_AUTO_WATERMARK and r.get("ok"):
                 await _watermark_auto()
+            # 组内 cookie 账号：纯 HTTP 探活（不需要浏览器），逐个更新状态机
+            if COOKIE_ACCOUNTS is not None:
+                for a in COOKIE_ACCOUNTS.list():
+                    ck = COOKIE_ACCOUNTS.cookie(a["name"])
+                    if not ck:
+                        continue
+                    st2, body2 = await asyncio.to_thread(_keepalive_probe_sync, ck)
+                    ok2 = (st2 == 200)
+                    COOKIE_ACCOUNTS.record_health(a["name"], ok2, st2,
+                                                  "alive" if ok2 else ("HTTP %s" % st2))
+                    if not ok2:
+                        print("[accounts] %s 探活失败 HTTP %s %s"
+                              % (a["name"], st2, body2[:80]), flush=True)
             # 号池生命周期：用健康观测驱动 自动隔离 / 自动恢复 / 超期剔除
             if ACCOUNT is not None:
                 frozen, logged = False, True
@@ -431,6 +444,7 @@ async def _keepalive_loop():
 async def _start_metrics():
     _init_metrics()
     _init_account()
+    _init_cookie_accounts()
 
 
 @app.on_event("startup")
@@ -474,6 +488,27 @@ def _init_metrics():
 
 
 ACCOUNT = None
+COOKIE_ACCOUNTS = None
+
+
+def _init_cookie_accounts():
+    """组内 cookie 账号库（C 方案：分组共享）。"""
+    global COOKIE_ACCOUNTS
+    import accounts as _acc
+    for d in (YB_ACCOUNTS_DIR, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".accounts")):
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".w")
+            with open(probe, "a"):
+                pass
+            os.remove(probe)
+            COOKIE_ACCOUNTS = _acc.CookieAccounts(d, YB_AUTO_DISABLE_AFTER,
+                                                  YB_AUTO_REENABLE_AFTER, YB_AUTO_EJECT_AFTER_DAYS)
+            print("[accounts] %s（组内 cookie 账号库）" % d, flush=True)
+            return
+        except Exception:
+            continue
+    print("[accounts] disabled: 无可写目录", flush=True)
 
 
 def _init_account():
@@ -613,6 +648,24 @@ def _wm_gray_ok(cookie: str):
         return g is not False
     except Exception:
         return None
+
+
+def _wm_ensure_cookie(cookie: str, target: bool = True) -> dict:
+    """按**给定 cookie** 直接读写无水印开关（组内 cookie 账号用，不需要浏览器）。"""
+    st, cur = _wm_read(cookie)
+    if st != 200:
+        return {"ok": False, "detail": "读取失败 HTTP %s" % st}
+    if cur.get("saveWithoutWatermark") is target:
+        return {"ok": True, "enabled": target, "detail": "已是目标状态"}
+    patch = {"saveWithoutWatermark": True, "hasPopupAgreement": True} if target else {"saveWithoutWatermark": False}
+    cur2 = {k: v for k, v in cur.items() if not str(k).startswith("__")}
+    st2, body = _wm_call(cookie, "/api/updateuserinfo",
+                         {"updateFields": [WM_FIELD], "userConfig": {WM_FIELD: {**cur2, **patch}}})
+    if st2 != 200:
+        return {"ok": False, "detail": "写入失败 HTTP %s %s" % (st2, body[:100])}
+    _, after = _wm_read(cookie)
+    return {"ok": after.get("saveWithoutWatermark") is target,
+            "enabled": after.get("saveWithoutWatermark"), "detail": "已写入"}
 
 
 async def _watermark_ensure(target: bool = True, force: bool = False) -> dict:
@@ -1922,12 +1975,16 @@ def _fleet_peers_all():
     自身识别**按名字优先**（peer 之间常用容器名/内网地址互通，此时与 YB_BASE_URL 不相等），
     URL 比对只作兜底。
     """
+    # 🔴 **只按名字判定自己**。原先还有"URL 相等也算自己"的兜底，
+    # 但多实例场景下 YB_BASE_URL 常拿到同一个默认值（如都等于 acc01 的域名），
+    # 于是 acc02/03/04 都会把 acc01 误认成"自己" —— 结果是拿自己的健康态和 key
+    # 去转发给 acc01，全部 401（实测踩过，排查了很久）。名字唯一，用它最稳。
     def _is_self(pp):
-        return (pp.get("name") == YB_INSTANCE_NAME_ENV
-                or (YB_BASE_URL_ENV and pp["url"].rstrip("/") == YB_BASE_URL_ENV))
+        return pp.get("name") == YB_INSTANCE_NAME_ENV
     out = [{**pp, "self": _is_self(pp)} for pp in _pool_peers()]
-    if YB_BASE_URL_ENV and not any(x["self"] for x in out):
-        out.insert(0, {"id": "self", "name": YB_INSTANCE_NAME_ENV, "url": YB_BASE_URL_ENV, "self": True})
+    if not any(x["self"] for x in out):
+        out.insert(0, {"id": "self", "name": YB_INSTANCE_NAME_ENV,
+                       "url": YB_BASE_URL_ENV or ("http://127.0.0.1:%d" % YB_SELF_PORT), "self": True})
     return out
 
 
@@ -2080,7 +2137,9 @@ _ROT_IDX = 0
 _ROT_LOCK = threading.Lock()
 
 
-def _peer_state_cached(url: str, ttl: int = 30):
+def _peer_state_cached(url: str, ttl: int = 8):
+    """peer 状态缓存。TTL 要短：账号可能在两次保活之间掉登录，
+    缓存太长会把请求发给已经不可用的 peer（实测 30s 内曾把请求打到刚登出的号上）。"""
     now = time.time()
     hit = _PEER_STATE_CACHE.get(url)
     if hit and now - hit[0] < ttl:
@@ -2105,8 +2164,25 @@ def _router_ok(st: dict) -> bool:
 
 
 def _router_targets():
-    """可参与轮询的实例：自己 + 各 peer（严格按 _router_ok 判定）。"""
+    """可参与轮询的：本组 cookie 账号 + 自己 + 各 peer（严格按 _router_ok 判定）。
+
+    组内 cookie 账号的 url 指向**本机端口**、key 直接放 cookie 串 ——
+    于是现有转发逻辑天然走 cookie 透传模式，不需要为它单独写一条请求路径。
+    """
     out = []
+    # ① 组内 cookie 账号（C 方案的主角）
+    if COOKIE_ACCOUNTS is not None:
+        for a in COOKIE_ACCOUNTS.list():
+            st = a.get("state") or {}
+            if not _router_ok(st):
+                continue
+            ck = COOKIE_ACCOUNTS.cookie(a["name"])
+            if not ck:
+                continue
+            out.append({"id": "ck_" + a["name"], "name": a["name"], "self": True,
+                        "url": "http://127.0.0.1:%d" % YB_SELF_PORT, "key": ck,
+                        "state": st, "cookie_account": a["name"]})
+    # ② 本实例自带浏览器账号 + 各 peer
     for t in _fleet_peers_all():
         if t.get("self"):
             st = ACCOUNT.get() if ACCOUNT else {"state": "enabled", "routable": True, "last_health": None}
@@ -2222,6 +2298,91 @@ async def admin_pool_request_status(req: Request, rid: str):
         return {"result": {"id": rid, "status": "error", "log": str(e)[:200]}}
 
 
+@app.get("/admin/group")
+async def admin_group(req: Request):
+    """本组的 cookie 账号列表（C 方案：一个实例=一个组，组内多个账号共用铸签浏览器）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if COOKIE_ACCOUNTS is None:
+        return JSONResponse({"error": "账号库未启用（YB_ACCOUNTS_DIR 不可写）"}, status_code=503)
+    return {"instance": YB_INSTANCE_NAME_ENV, "accounts": COOKIE_ACCOUNTS.list(),
+            "note": "组内账号共用本实例浏览器的设备指纹；跨组隔离靠部署多个实例"}
+
+
+@app.post("/admin/group")
+async def admin_group_op(req: Request):
+    """组内账号操作。
+
+    action:
+      capture — **把当前浏览器的登录态存成一个账号**（扫码登录后点一下即可）；
+                可选 name（默认自动 ybNN）、note
+      remove  — 删除账号
+      enable / disable / reset / eject — 生命周期（复用状态机，规则与实例账号一致）
+      keepalive — 立刻用该账号 cookie 探活一次
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if COOKIE_ACCOUNTS is None:
+        return JSONResponse({"error": "账号库未启用"}, status_code=503)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    action = (body.get("action") or "").strip()
+    name = (body.get("name") or "").strip()
+    note = (body.get("note") or "").strip()
+
+    if action == "capture":
+        import cdp_minter
+        try:
+            cookie = await asyncio.to_thread(cdp_minter.get_minter().extract_cookies)
+        except Exception as e:
+            return JSONResponse({"error": "读取浏览器 cookie 失败: %s" % str(e)[:120]}, status_code=502)
+        if not name:
+            existing = {x["name"] for x in COOKIE_ACCOUNTS.list()}
+            i = 1
+            while ("yb%02d" % i) in existing:
+                i += 1
+            name = "yb%02d" % i
+        r = COOKIE_ACCOUNTS.add(name, cookie, note)
+        if not r.get("ok"):
+            return JSONResponse({"error": r.get("error")}, status_code=400)
+        # 抓到就立刻探活 + 补无水印（都是纯 HTTP，不需要浏览器）
+        st, detail = 0, ""
+        try:
+            ck = COOKIE_ACCOUNTS.cookie(name)
+            st, body_txt = await asyncio.to_thread(_keepalive_probe_sync, ck)
+            detail = "alive" if st == 200 else ("HTTP %s" % st)
+            COOKIE_ACCOUNTS.record_health(name, st == 200, st, detail)
+            if st == 200 and YB_AUTO_WATERMARK:
+                await asyncio.to_thread(_wm_ensure_cookie, ck, True)
+        except Exception as e:
+            detail = "探活异常: %s" % str(e)[:80]
+        return {"result": {"ok": True, "name": name, "replaced": r.get("replaced"),
+                           "cookie_len": r.get("cookie_len"), "health": detail, "http": st},
+                "hint": "已存为本组账号；可再点「重置登录态」清掉浏览器登录态，接着扫下一个号"}
+
+    if not name:
+        return JSONResponse({"error": "缺少 name"}, status_code=400)
+    if action in ("remove", "delete"):
+        return {"result": COOKIE_ACCOUNTS.remove(name)}
+    if action == "keepalive":
+        ck = COOKIE_ACCOUNTS.cookie(name)
+        if not ck:
+            return JSONResponse({"error": "账号不存在或没有 cookie"}, status_code=404)
+        st, body_txt = await asyncio.to_thread(_keepalive_probe_sync, ck)
+        COOKIE_ACCOUNTS.record_health(name, st == 200, st, "alive" if st == 200 else "HTTP %s" % st)
+        return {"result": {"name": name, "http": st, "ok": st == 200, "body": body_txt[:160],
+                           "state": COOKIE_ACCOUNTS.state(name)}}
+    if action in ("enable", "disable", "reset", "eject"):
+        r = COOKIE_ACCOUNTS._state(name).apply(action, note or "手动%s" % action, by="manual")
+        return {"result": r}
+    return JSONResponse({"error": "未知 action：%s（capture|remove|enable|disable|reset|eject|keepalive）" % action},
+                        status_code=400)
+
+
 @app.get("/admin/accounts")
 async def admin_accounts(req: Request):
     """整个号池的账号清单：状态 + 健康 + 近 24h 调用量（管理页数据源）。"""
@@ -2243,7 +2404,16 @@ async def admin_accounts(req: Request):
                 "error": r.get("error")}
 
     res = await asyncio.gather(*[one(t) for t in targets]) if targets else []
-    routable = [x for x in res if (x.get("state") or {}).get("routable")]
+    # 本组 cookie 账号（C 方案）也列进来，并与实例区分 kind
+    for x in res:
+        x["kind"] = "instance"
+    if COOKIE_ACCOUNTS is not None:
+        for a in COOKIE_ACCOUNTS.list():
+            res.append({"name": a["name"], "url": "(本组 cookie 账号)", "self": True,
+                        "ok": True, "kind": "cookie", "state": a.get("state") or {},
+                        "stats": {}, "note": a.get("note", ""), "cookie_len": a.get("cookie_len", 0)})
+    routable = [x for x in res if (x.get("state") or {}).get("routable")
+                and (((x.get("state") or {}).get("last_health") or {}).get("ok") is True or False)]
     return {"accounts": res, "routable": len(routable), "total": len(res),
             "build_version": YB_BUILD_VERSION,
             "router_enabled": YB_ROUTER, "router_entry": "/pool/v1",
@@ -3033,7 +3203,8 @@ MANAGE_HTML = """<!DOCTYPE html>
   <button class="ghost" onclick="batch('keepalive')">批量保活</button>
   <button class="ghost" onclick="batch('watermark')">批量开无水印</button>
   <button class="ghost" onclick="batch('state')">批量查状态</button>
-  <button onclick="addAccount()" id="addBtn" style="border-color:#3B6D11;background:#3B6D11">＋ 添加账号（一键）</button>
+  <button onclick="addAccount()" id="addBtn" style="border-color:#3B6D11;background:#3B6D11">＋ 新建分组实例</button>
+  <button onclick="captureAccount()" id="capBtn" style="border-color:#185FA5;background:#185FA5">💾 保存当前登录为账号</button>
 </div>
 <div id="opMsg" class="muted" style="margin-bottom:12px"></div>
 
@@ -3121,7 +3292,9 @@ function render(accs) {
     const s = a.stats || {};
     const nm = esc(a.name || a.url);
     h += '<tr>';
-    h += '<td>' + nm + (a.self ? ' <span class="badge">本实例</span>' : '') + '</td>';
+    const kb = (a.kind === 'cookie') ? ' <span class="badge ok">组内账号</span>'
+               : (a.self ? ' <span class="badge">本实例</span>' : '');
+    h += '<td>' + nm + kb + '</td>';
     h += '<td class="muted">' + esc(a.error || a.url || '') + '</td>';
     h += '<td>' + (STATE_BADGE[st.state] || STATE_BADGE.unknown) + '</td>';
     h += '<td class="muted">' + esc((st.reason || '').slice(0, 46)) + '</td>';
@@ -3129,12 +3302,16 @@ function render(accs) {
     h += '<td>' + healthBadge(st.last_health) + '</td>';
     h += '<td class="num"><span style="color:#3B6D11">' + (s.ok || 0) + '</span> / <span style="color:#A32D2D">' + (s.err || 0) + '</span></td>';
     const name = esc(a.name || '');
+    const kind = a.kind || 'instance';
     h += '<td><div class="acts">'
-      + '<button class="okb" onclick="act(\\'' + name + '\\',\\'enable\\')">启用</button>'
-      + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'disable\\')">禁用</button>'
-      + '<button class="danger" onclick="act(\\'' + name + '\\',\\'eject\\')">剔除</button>'
-      + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'reset\\')">重置</button>'
-      + '<button class="ghost" onclick="openQr(\\'' + name + '\\')">扫码</button>'
+      + '<button class="okb" onclick="act(\\'' + name + '\\',\\'enable\\',\\'' + kind + '\\')">启用</button>'
+      + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'disable\\',\\'' + kind + '\\')">禁用</button>'
+      + '<button class="ghost" onclick="act(\\'' + name + '\\',\\'reset\\',\\'' + kind + '\\')">重置</button>'
+      + (kind === 'cookie'
+          ? '<button class="ghost" onclick="kaAccount(\\'' + name + '\\')">保活</button>'
+            + '<button class="danger" onclick="delAccount(\\'' + name + '\\')">删除</button>'
+          : '<button class="danger" onclick="act(\\'' + name + '\\',\\'eject\\',\\'' + kind + '\\')">剔除</button>'
+            + '<button class="ghost" onclick="openQr(\\'' + name + '\\')">扫码</button>')
       + '</div></td>';
     h += '</tr>';
     for (const ev of (st.history || []).slice(-6).reverse()) {
@@ -3155,23 +3332,67 @@ function render(accs) {
   }
 }
 
+async function kaAccount(name) {
+  $('opMsg').textContent = '正在用该账号 cookie 探活…';
+  try {
+    const r = await fetch('/admin/group', { method: 'POST', headers: H(),
+      body: JSON.stringify({ action: 'keepalive', name: name }) });
+    const d = await r.json();
+    $('opMsg').innerHTML = d.error ? '<span class="err-txt">' + esc(d.error) + '</span>'
+      : '『' + esc(name) + '』探活：HTTP ' + (d.result || {}).http;
+    load();
+  } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+async function delAccount(name) {
+  if (!confirm('确认删除组内账号 ' + name + '？（只删本地 cookie，不影响元宝账号）')) return;
+  try {
+    const r = await fetch('/admin/group', { method: 'POST', headers: H(),
+      body: JSON.stringify({ action: 'remove', name: name }) });
+    const d = await r.json();
+    $('opMsg').innerHTML = d.error ? '<span class="err-txt">' + esc(d.error) + '</span>'
+      : '已删除 ' + esc(name);
+    load();
+  } catch (e) {}
+}
+
 function openQr(name) {
   window.open('/pool/peer/' + encodeURIComponent(name) + '/qr?k=' + encodeURIComponent(KEY), '_blank');
 }
 
-async function act(name, action) {
+async function act(name, action, kind) {
   let reason = '';
   if (action !== 'enable' && action !== 'reset') {
     reason = prompt('给这次「' + action + '」写个原因（可留空）：', '') || '';
   }
   try {
-    const r = await fetch('/admin/account', { method: 'POST', headers: H(),
-      body: JSON.stringify({ action: action, reason: reason, name: name }) });
+    const url = (kind === 'cookie') ? '/admin/group' : '/admin/account';
+    const r = await fetch(url, { method: 'POST', headers: H(),
+      body: JSON.stringify({ action: action, reason: reason, note: reason, name: name }) });
     const d = await r.json();
     $('opMsg').innerHTML = d.error ? '<span class="err-txt">' + esc(d.error) + '</span>'
       : '已对 <b>' + esc(name) + '</b> 执行 <b>' + esc(action) + '</b>';
     load();
   } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+async function captureAccount() {
+  if (!KEY) { $('opMsg').innerHTML = '<span class="err-txt">请先填写门禁 Key</span>'; return; }
+  const btn = $('capBtn');
+  btn.disabled = true;
+  $('opMsg').textContent = '正在把 acc01 浏览器当前的登录态存成组内账号…';
+  try {
+    const r = await fetch('/admin/group', { method: 'POST', headers: H(),
+      body: JSON.stringify({ action: 'capture' }) });
+    const d = await r.json();
+    if (d.error) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(d.error) + '</span>'; return; }
+    const x = d.result || {};
+    $('opMsg').innerHTML = '\u2705 已存为组内账号 <b>' + esc(x.name) + '</b>'
+      + '（cookie ' + x.cookie_len + ' 字节 · 探活 ' + esc(String(x.health)) + '）'
+      + ' —— 想继续加号：点「重置登录态」→ 扫下一个号 → 再点本按钮。';
+    load();
+  } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+  finally { btn.disabled = false; }
 }
 
 let ADD_TIMER = null;
@@ -3461,6 +3682,8 @@ POOL_HTML = MANAGE_HTML   # /pool 与 /manage 是同一个"号池管理"页（�
 
 YB_POOL_FILE = os.environ.get("YB_POOL_FILE", "/data/pool.json")
 # 自动加号通道（页面写请求 → 宿主机 pool-provisioner 执行 → 写结果）
+YB_ACCOUNTS_DIR = os.environ.get("YB_ACCOUNTS_DIR", "/data/accounts")
+YB_SELF_PORT = int(os.environ.get("YUANBAO_PROXY_PORT", "39177"))
 YB_REQ_DIR = os.environ.get("YB_REQ_DIR", "/data/requests")
 YB_RES_DIR = os.environ.get("YB_RES_DIR", "/data/results")
 _POOL_CACHE = {"mtime": None, "peers": None}

@@ -67,7 +67,7 @@ YB_STATS_KEEP_DAYS = int(os.environ.get("YB_STATS_KEEP_DAYS", "30"))
 # 号池生命周期：状态文件目录 + 自动规则阈值
 YB_STATE_DIR = os.environ.get("YB_STATE_DIR", "/data/state")
 YB_AUTO_DISABLE_AFTER = int(os.environ.get("YB_AUTO_DISABLE_AFTER", "3"))       # 连续保活失败几次→自动隔离
-YB_AUTO_REENABLE_AFTER = int(os.environ.get("YB_AUTO_REENABLE_AFTER", "3"))     # 连续成功几次→自动恢复（0=不自动恢复）
+YB_AUTO_REENABLE_AFTER = int(os.environ.get("YB_AUTO_REENABLE_AFTER", "1"))     # 连续成功几次→自动恢复（0=不自动恢复）
 YB_AUTO_EJECT_AFTER_DAYS = int(os.environ.get("YB_AUTO_EJECT_AFTER_DAYS", "0")) # 隔离超几天→自动剔除（0=关闭）
 YB_ROUTER = os.environ.get("YB_ROUTER", "1") == "1"                            # 是否开放 /pool/v1 轮询入口
 # 构建版本（由 update-service.sh 注入 git describe，便于确认"线上跑的是哪个版本"）
@@ -327,10 +327,13 @@ async def _keepalive_once() -> dict:
         r = {"ok": False, "status": None, "detail": "取 cookie 失败: %s" % str(e)[:160], "cookie_len": 0}
         return r
     if not cookie:
-        return {"ok": False, "status": None, "detail": "页面无 cookie（未登录？）", "cookie_len": 0}
-    # hy_user 是元宝登录态本体；没有它说明页面处于未登录/已重置状态
+        return {"ok": False, "status": None, "reason": "not_logged_in",
+                "detail": "页面无 cookie（未登录？）", "cookie_len": 0}
+    # hy_user 是元宝登录态本体；没有它说明页面处于未登录/已重置状态 —— 这是**配置态**，
+    # 不是健康故障，故打上 reason 供上层区分（不计失败、不自动隔离）
     if "hy_user=" not in (cookie + ";"):
-        return {"ok": False, "status": None, "detail": "缺少 hy_user（未登录）", "cookie_len": len(cookie)}
+        return {"ok": False, "status": None, "reason": "not_logged_in",
+                "detail": "缺少 hy_user（未登录）", "cookie_len": len(cookie)}
     st, body = await asyncio.to_thread(_keepalive_probe_sync, cookie)
     return {"ok": st == 200, "status": st,
             "detail": body if st != 200 else "alive", "cookie_len": len(cookie)}
@@ -347,25 +350,41 @@ def _record_keepalive(r: dict) -> dict:
     return _KEEPALIVE
 
 
-async def _keepalive_probe_now():
-    """立刻做一次保活并把结果落进状态机（供 /admin/state 触发，避免新号等一个周期）。"""
+async def _keepalive_probe_now(with_watermark: bool = True):
+    """立刻保活一次：探活 → 落状态机 →（可选）补无水印。
+
+    🔴 这是"登录后一键就绪"的核心：只探活不落状态机的话，账号**不会被判定为可轮询**
+    （路由门禁要求 last_health.ok===True）。所以这里必须把健康观测写进状态机。
+    """
+    r, frozen, acc = {"ok": False, "detail": "未执行"}, False, None
     try:
         r = await _keepalive_once()
-        snap = _record_keepalive(r)
+        _record_keepalive(r)
+        import cdp_minter
+        try:
+            stt = await asyncio.to_thread(cdp_minter.get_minter().page_state)
+            frozen = bool(stt.get("frozen"))
+        except Exception:
+            pass
         if ACCOUNT is not None:
-            import cdp_minter
-            frozen = False
-            try:
-                stt = await asyncio.to_thread(cdp_minter.get_minter().page_state)
-                frozen = bool(stt.get("frozen"))
-            except Exception:
-                pass
-            ACCOUNT.record_health(bool(r.get("ok")), r.get("status"), r.get("detail", ""), frozen)
+            acc, act = ACCOUNT.record_health(bool(r.get("ok")), r.get("status"),
+                                             r.get("detail", ""), frozen,
+                                             count_failure=(r.get("reason") != "not_logged_in"))
+            # 显式恢复：按需保活（一般由"页面发现刚登录"触发）成功时，
+            # 只要是**自动**隔离就立刻回池，不再等连续成功计数
+            if r.get("ok") and acc.get("state") == "quarantined" and acc.get("changed_by") == "auto":
+                acc, act = ACCOUNT.apply("enable", "保活成功，自动恢复入池", by="auto")
+                print("[pool_state] auto enable:recovered-now", flush=True)
+            if act:
+                print("[pool_state] auto %s → %s（%s）" % (act, acc["state"], acc["reason"]), flush=True)
+        if with_watermark and YB_AUTO_WATERMARK and r.get("ok"):
+            w = await _watermark_ensure(True)
+            _record_watermark(w)
         print("[keepalive] 按需触发 ok=%s %s" % (r.get("ok"), r.get("detail", "")[:80]), flush=True)
-        return snap
     except Exception as e:
         print("[keepalive] 按需触发失败: %s" % str(e)[:120], flush=True)
-        return None
+        r = {"ok": False, "detail": "触发失败: %s" % str(e)[:120]}
+    return {"probe": r, "account": acc, "keepalive": _KEEPALIVE, "watermark": _WATERMARK}
 
 
 async def _keepalive_loop():
@@ -394,7 +413,8 @@ async def _keepalive_loop():
                 ok_now, det = bool(r.get("ok")), r.get("detail", "")
                 if not logged:
                     ok_now, det = False, det or "页面未登录"
-                a, act = ACCOUNT.record_health(ok_now, r.get("status"), det, frozen)
+                a, act = ACCOUNT.record_health(ok_now, r.get("status"), det, frozen,
+                                               count_failure=(r.get("reason") != "not_logged_in"))
                 if act:
                     print("[pool_state] auto %s → %s（%s）" % (act, a["state"], a["reason"]), flush=True)
                 elif a["state"] != "enabled":
@@ -1783,7 +1803,8 @@ async def admin_state(req: Request):
             and not (ACCOUNT.get().get("last_health") or {}).get("ok")
             and time.time() - _KEEPALIVE.get("at", 0) > 20):
         asyncio.create_task(_keepalive_probe_now())
-    return {"result": st, "keepalive": _KEEPALIVE, "watermark": _WATERMARK}
+    return {"result": st, "keepalive": _KEEPALIVE, "watermark": _WATERMARK,
+            "account": (ACCOUNT.get() if ACCOUNT else None)}
 
 
 @app.api_route("/admin/keepalive", methods=["GET", "POST"])
@@ -1794,8 +1815,10 @@ async def admin_keepalive(req: Request):
         return cred
     if YB_MINT_BACKEND != "cdp":
         return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
-    r = await _keepalive_once()
-    return {"result": r, "last": _record_keepalive(r)}
+    # 走 probe_now：探活 + **落状态机** + 补无水印 —— 保证"保活一次"后账号立刻可被轮询
+    out = await _keepalive_probe_now()
+    return {"result": out.get("probe"), "account": out.get("account"),
+            "last": out.get("keepalive"), "watermark": out.get("watermark")}
 
 
 @app.api_route("/admin/watermark", methods=["GET", "POST"])
@@ -2350,6 +2373,7 @@ QR_HTML = """<!DOCTYPE html>
   .muted { color:var(--muted); font-size:12px; margin-top:8px; }
   .status { margin-top:8px; font-size:12px; }
   .ok { color:#3B6D11; } .err { color:#A32D2D; } .warn { color:#854F0B; }
+  .danger { border-color:#A32D2D !important; background:#A32D2D !important; color:#fff !important; }
   .warnbar { background:#fdf3e3; border:1px solid #e8cfa0; color:#854F0B; border-radius:8px;
              padding:8px 10px; font-size:12px; margin-bottom:10px; text-align:left; }
   .okbar { background:#eef7e9; border:1px solid #b8d9a4; color:#3B6D11; border-radius:8px;
@@ -2360,7 +2384,8 @@ QR_HTML = """<!DOCTYPE html>
 <h1>元宝登录（登录态持久化到容器）</h1>
 <div class="wrap">
   <input id="key" type="password" placeholder="门禁 Key（浏览器本地保存）">
-  <div class="muted" id="kinfo" style="margin:-4px 0 10px"></div>
+  <div class="muted" id="inst" style="margin:-6px 0 2px;font-weight:500"></div>
+  <div class="muted" id="kinfo" style="margin:0 0 10px"></div>
   <div id="warn" style="display:none"></div>
 
   <div class="tabs">
@@ -2391,11 +2416,11 @@ QR_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="row">
-    <button class="ghost" onclick="refresh(true)">立即刷新</button>
+    <button class="ghost" onclick="refresh(true);checkState()">立即刷新</button>
     <button class="ghost" onclick="saveKey()">保存 Key</button>
   </div>
   <div class="row">
-    <button class="ghost" onclick="resetLogin()">重置登录态（清 cookie · 换账号用）</button>
+    <button class="ghost" id="resetBtn" onclick="resetLogin()">重置登录态（清 cookie · 换账号用）</button>
   </div>
   <div class="status" id="st">等待 Key…</div>
   <div class="muted" id="tip">用微信扫码完成登录 · 自动刷新 · 已登录后此处显示当前页面</div>
@@ -2408,11 +2433,26 @@ let TAB = (new URLSearchParams(location.search).get('tab') === 'phone') ? 'phone
 const $ = (id) => document.getElementById(id);
 const st = $('st'), phSt = $('phSt');
 $('key').value = KEY;
-(function () {
-  const e = $('kinfo'); if (!e) return;
-  e.textContent = KEY ? ('当前 Key：' + KEY.slice(0, 12) + '…' + KEY.slice(-4) + '（长度 ' + KEY.length + '）')
-                      : '未载入 Key —— 请用带 ?k= 的完整链接打开本页';
+let INST = '';
+(async function () {
+  try {
+    const r = await fetch('/admin/whoami', { headers: { 'Authorization': 'Bearer ' + KEY } });
+    if (r.ok) {
+      const d = await r.json();
+      INST = d.name || '';
+      const e = $('inst');
+      if (e) e.textContent = INST ? ('\u25b6 当前操作实例：' + INST + (d.base_url ? '（' + d.base_url + '）' : '')) : '';
+    }
+  } catch (e) {}
 })();
+
+function showKeyInfo() {
+  const e = $('kinfo'); if (!e) return;
+  e.textContent = KEY
+    ? ('已保存 \u2713 当前 Key：' + KEY.slice(0, 12) + '\u2026' + KEY.slice(-4) + '（长度 ' + KEY.length + '）')
+    : '未载入 Key \u2014\u2014 请用带 ?k= 的完整链接打开本页，或手动填写后保存';
+}
+showKeyInfo();
 
 function setTab(t) {
   TAB = t;
@@ -2448,11 +2488,37 @@ function refresh(force) {
   }
 }
 
-function saveKey() {
-  KEY = $('key').value.trim();
+function saveKey(silent) {
+  KEY = ($('key').value || '').trim();
+  // 多处兜底：先写 localStorage，再写会话变量；sandbox 里 localStorage 会抛，不能让整段挂掉
   try { localStorage.setItem('yb_key', KEY); } catch (e) {}
+  showKeyInfo();
+  if (!KEY) {
+    st.textContent = '门禁 Key 为空 —— 请填写，或改用带 ?k= 的完整链接打开本页';
+    st.className = 'status err';
+    return;
+  }
+  if (!silent) { st.textContent = '已保存 \u2713 正在刷新\u2026'; st.className = 'status ok'; }
+  POLL_MS = 6000;
   refresh(true);
+  checkState();
 }
+
+// 输入即自动保存（防抖 600ms）—— 不必非得点按钮，避免"点了没生效"的体感
+(function () {
+  const el = $('key'); let t = null;
+  if (!el) return;
+  el.addEventListener('input', function () {
+    clearTimeout(t);
+    t = setTimeout(function () {
+      KEY = (el.value || '').trim();
+      try { localStorage.setItem('yb_key', KEY); } catch (e2) {}
+      showKeyInfo();
+      st.textContent = KEY ? '已自动保存 \u2713（也可点「保存 Key」立即刷新）' : 'Key 为空';
+      st.className = 'status ' + (KEY ? 'ok' : 'err');
+    }, 600);
+  });
+})();
 
 async function sendCode() {
   if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
@@ -2502,30 +2568,76 @@ async function verifyCode() {
   } catch (e) { phSt.textContent = String(e); phSt.className = 'status err'; }
 }
 
+let LAST_LOGGED = null, POLL_MS = 6000, POLL_BUSY = false;
+
+function stageOf(d) {
+  const stt = d.result || {}, acc = d.account || {};
+  const h = acc.last_health || {};
+  const wm = d.watermark || {};
+  if (stt.frozen) return { cls: 'warnbar', txt: '\u26a0\ufe0f 该号已被冻结，页面上没有「登录」按钮 —— 请先点下方「重置登录态」，再换号登录。' };
+  if (!stt.logged_in) return { cls: 'warnbar', txt: '\u23f3 等待扫码登录\u2026（扫完本页会在几秒内自动更新，无需手动刷新）' };
+  const wmTxt = (wm.enabled === true) ? ' · 无水印保存 已开启 \u2713'
+              : (wm.enabled === false) ? ' · 无水印保存 未开启（正在补开\u2026）' : '';
+  if (h.ok === true && acc.state === 'enabled') return { cls: 'okbar', txt: '\u2705 已登录，且**已加入号池**（可被轮询调用）' + wmTxt };
+  if (acc.state === 'quarantined') return { cls: 'warnbar', txt: '\u2713 已登录，但当前处于自动隔离，正在恢复入池\u2026' };
+  if (acc.state === 'disabled' || acc.state === 'ejected') return { cls: 'warnbar', txt: '\u2713 已登录，但该号被手动禁用/剔除了 —— 去号池管理页点「启用」即可回池。' + wmTxt };
+  return { cls: 'okbar', txt: '\u2713 已登录，正在验证并加入号池\u2026（几秒后自动完成）' };
+}
+
 async function checkState() {
-  if (!KEY) return;
+  if (!KEY || POLL_BUSY) return;
+  POLL_BUSY = true;
   const w = $('warn');
   try {
     const r = await fetch('/admin/state', { headers: { 'Authorization': 'Bearer ' + KEY } });
-    const d = (await r.json()).result || {};
-    if (d.frozen) {
+    if (r.status === 401) {
       w.className = 'warnbar'; w.style.display = '';
-      w.textContent = '⚠️ 容器当前账号已被冻结，页面上没有「登录」按钮 —— 请先点下方「重置登录态」，再扫码或用手机号登入新账号。';
-    } else if (d.logged_in) {
-      const wm = d.watermark || {};
-      const wmTxt = (wm.enabled === true) ? '· 无水印保存 已开启 ✓'
-                  : (wm.enabled === false) ? '· 无水印保存 未开启（正在自动补开…）'
-                  : '· 无水印保存 待检测';
-      w.className = 'okbar'; w.style.display = '';
-      w.textContent = '✓ 容器已登录（' + (d.url || '') + '） ' + wmTxt;
-    } else {
-      w.style.display = 'none';
+      w.textContent = '\u26a0\ufe0f 门禁 Key 被拒绝（401）—— 请在上方重新填写并保存。';
+      return;
     }
-  } catch (e) {}
+    const d = await r.json();
+    let s = stageOf(d);
+    w.className = s.cls; w.style.display = ''; w.textContent = s.txt;
+
+    const logged = !!(d.result || {}).logged_in;
+    const healthy = ((d.account || {}).last_health || {}).ok === true;
+    // 🔴 刚登录但还没进池 → 立刻保活一次（会把健康写进状态机，从而**马上**可被轮询）
+    const accState = (d.account || {}).state;
+    if (logged && d.result && !d.result.frozen && (!healthy || accState !== 'enabled')) {
+      try {
+        const k2 = await fetch('/admin/keepalive', { method: 'POST', headers: { 'Authorization': 'Bearer ' + KEY } });
+        const d2 = await k2.json();
+        s = stageOf({ result: d.result, account: d2.account || d.account, watermark: d2.watermark || d.watermark });
+        w.className = s.cls; w.textContent = s.txt;
+      } catch (e2) {}
+    }
+    LAST_LOGGED = logged;
+    POLL_MS = logged ? 20000 : 6000;   // 未登录时快轮询（扫码后几秒内就能反映），登录后放慢
+  } catch (e) {
+  } finally { POLL_BUSY = false; }
 }
 
+let RESET_ARMED = false, RESET_T = null;
+// 🔴 重置是**破坏性**操作（会把该号的登录态清掉）。实测被误点，把正常号登出了。
+// 所以改成两步确认，并在按钮上写明要重置的是哪个实例。
 async function resetLogin() {
   if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
+  const btn = $('resetBtn');
+  if (!RESET_ARMED) {
+    RESET_ARMED = true;
+    if (btn) { btn.className = 'danger'; btn.textContent = '\u26a0\ufe0f 再点一次确认：重置「' + (INST || '本实例') + '」的登录态'; }
+    st.textContent = '重置会清除「' + (INST || '本实例') + '」的登录态（需重新扫码）。8 秒内再点一次生效。';
+    st.className = 'status warn';
+    clearTimeout(RESET_T);
+    RESET_T = setTimeout(function () {
+      RESET_ARMED = false;
+      if (btn) { btn.className = 'ghost'; btn.textContent = '重置登录态（清 cookie · 换账号用）'; }
+      st.textContent = ''; st.className = 'status';
+    }, 8000);
+    return;
+  }
+  RESET_ARMED = false; clearTimeout(RESET_T);
+  if (btn) { btn.className = 'ghost'; btn.textContent = '重置登录态（清 cookie · 换账号用）'; }
   st.textContent = '重置登录态中（清 cookie + localStorage 并重载页面）…'; st.className = 'status';
   try {
     const r = await fetch('/login/reset', { method: 'POST', headers: { 'Authorization': 'Bearer ' + KEY } });
@@ -2536,9 +2648,11 @@ async function resetLogin() {
   } catch (e) { st.textContent = String(e); st.className = 'status err'; }
 }
 
-setInterval(function () { if (TAB === 'wechat') refresh(); checkState(); }, 20000);
+async function stateTick() { await checkState(); setTimeout(stateTick, POLL_MS); }
+function imgTick() { if (TAB === 'wechat') refresh(); setTimeout(imgTick, 20000); }
 setTab(TAB);
-checkState();
+stateTick();
+imgTick();
 </script>
 </body>
 </html>
@@ -2736,11 +2850,20 @@ NAV_HTML = """<style>
 </div>
 <script>
 (function () {
-  var k = '';
-  try { k = localStorage.getItem('yb_key') || ''; } catch (e) {}
+  // 导航注入在 <body> 之后、页面脚本之前 ⇒ 此刻 localStorage 可能还是空的，
+  // 所以必须同时从 ?k= 取，否则跨实例链接会丢掉 key 前缀
+  var qk = (new URLSearchParams(location.search).get('k') || '').trim();
+  var k = qk;
+  try { k = qk || (localStorage.getItem('yb_key') || ''); } catch (e) { k = qk; }
+  // 经跨实例代理打开时（/pool/peer/<name>/...），导航保持该实例上下文，
+  // 否则"扫码 / 登录"会跳到本实例，容易误操作到别的号
+  var m = location.pathname.match(/^\/pool\/peer\/([^\/]+)\//);
+  var peer = m ? m[1] : '';
   document.querySelectorAll('.ybnav a').forEach(function (a) {
     var h = (a.getAttribute('data-h') || '').split(',');
-    if (k) a.href = h[0] + '?k=' + encodeURIComponent(k);
+    var base = h[0];
+    if (peer && base === '/qr') base = '/pool/peer/' + peer + '/qr';
+    if (k) a.href = base + '?k=' + encodeURIComponent(k);
     if (h.indexOf(location.pathname) >= 0) a.className = 'cur';
   });
 })();
@@ -2811,6 +2934,17 @@ MANAGE_HTML = """<!DOCTYPE html>
   <div id="list" class="muted">加载中…</div>
 </div>
 
+<div class="card" style="border-color:#e8cfa0;background:#fdf9f3">
+  <h2>如何加新号（重要：一个实例只能装一个账号）</h2>
+  <div class="muted" style="text-align:left;line-height:1.9">
+    账号登录态存在每个实例**自己的** Chromium profile 里，<b>一个实例只能有一个登录账号</b>。<br>
+    在同一个实例上重复扫码，只会<b>替换</b>那个号的登录态，<b>不会新增账号</b> —— 这是"扫了几个号却看不到"的原因。<br><br>
+    <b>加号就一条命令</b>（端口可省略，自动分配；会建目录 / 注册 / 直接起容器，<b>无需重启其它实例</b>）：
+    <div style="margin:6px 0"><code>cd /opt/yuanbao/build &amp;&amp; ./add-account.sh acc03</code></div>
+    然后点新账号那一行的「扫码」按钮，扫它自己的二维码即可。登录后约 20 秒自动进号池。
+  </div>
+</div>
+
 <div class="card">
   <h2>自动规则与轮询入口</h2>
   <div class="rules" id="rules"></div>
@@ -2856,7 +2990,7 @@ async function load() {
     if (r.status === 401) { $('list').innerHTML = '<span class="err-txt">Key 被拒绝（401）</span>'; return; }
     const d = await r.json();
     LAST = d;
-    $('sum').textContent = '（可路由 ' + d.routable + ' / 共 ' + d.total + '）';
+    $('sum').textContent = '（可路由 ' + d.routable + ' / 共 ' + d.total + ' · 每 15 秒自动刷新）';
     const a = d.auto || {};
     $('rules').innerHTML =
       '<span>自动隔离：连续失败 ≥ <b>' + a.disable_after + '</b> 次 或 账号被冻结</span>'
@@ -2946,6 +3080,8 @@ async function batch(op) {
 }
 
 if (KEY) load(); else $('list').textContent = '请先填写门禁 Key（或 YB_FLEET_KEY）';
+// 自动刷新：扫码登录后新号会自动出现在清单里，不必手动点刷新
+setInterval(function () { if (!document.hidden && KEY) load(); }, 15000);
 </script>
 </body>
 </html>
@@ -3172,9 +3308,13 @@ POOL_HTML = MANAGE_HTML   # /pool 与 /manage 是同一个"号池管理"页（�
 
 
 
-def _pool_peers():
-    """YB_POOL_PEERS: JSON 数组 [{"name","url"}] 或 "name=url,name2=url2" 形式。"""
-    raw = os.environ.get("YB_POOL_PEERS", "").strip()
+YB_POOL_FILE = os.environ.get("YB_POOL_FILE", "/data/pool.json")
+_POOL_CACHE = {"mtime": None, "peers": None}
+
+
+def _parse_peers_raw(raw: str):
+    """把 "name=url[,name2=url2]" 或 JSON 数组解析成 peer 列表。"""
+    raw = (raw or "").strip()
     peers = []
     if not raw:
         return peers
@@ -3191,17 +3331,42 @@ def _pool_peers():
             if "=" in item:
                 name, url = item.split("=", 1)
             else:
-                name, url = f"acc{i+1}", item
+                name, url = "acc%d" % (i + 1), item
             name, url = name.strip(), url.strip()
-            # 支持 name=url|key —— 轮询转发需要目标实例自己的 API key（/v1 只认实例 key）
             pkey = ""
-            if "|" in url:
+            if "|" in url:                      # name=url|key（轮询转发需要目标实例的 key）
                 url, pkey = url.split("|", 1)
             peers.append({"name": name, "url": url.strip().rstrip("/"), "key": pkey.strip()})
     for i, x in enumerate(peers):
-        x["id"] = f"p{i}"
-        x.setdefault("name", f"acc{i+1}")
+        x["id"] = "p%d" % i
+        x.setdefault("name", "acc%d" % (i + 1))
+        x.setdefault("key", "")
+        x["url"] = str(x["url"]).rstrip("/")
     return peers
+
+
+def _pool_peers():
+    """号池清单。**优先读共享注册表 YB_POOL_FILE(pool.json)**，按 mtime 热重载 ⇒ 加号后
+    各实例无需重启即可看到新 peer；文件不存在时退回环境变量 YB_POOL_PEERS。"""
+    try:
+        mt = os.path.getmtime(YB_POOL_FILE)
+    except OSError:
+        mt = None
+    if mt is not None:
+        if _POOL_CACHE["mtime"] != mt or _POOL_CACHE["peers"] is None:
+            try:
+                with open(YB_POOL_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                ps = data.get("peers") if isinstance(data, dict) else data
+                _POOL_CACHE["peers"] = _parse_peers_raw(json.dumps(ps or []))
+                _POOL_CACHE["mtime"] = mt
+            except Exception as e:
+                print("[pool] 读取 %s 失败，退回 env：%s" % (YB_POOL_FILE, str(e)[:80]), flush=True)
+                _POOL_CACHE["peers"] = None
+        if _POOL_CACHE["peers"] is not None and _POOL_CACHE["peers"]:
+            return _POOL_CACHE["peers"]
+    raw = os.environ.get("YB_POOL_PEERS", "").strip()
+    return _parse_peers_raw(raw)
 
 
 @app.get("/admin", response_class=Response)
@@ -3233,7 +3398,7 @@ async def manage_page(req: Request):
 
 @app.get("/admin/whoami")
 async def admin_whoami(req: Request):
-    cred = _check_auth(req)
+    cred = _check_admin_panel_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
     return {"name": os.environ.get("YB_INSTANCE_NAME", "yuanbao-proxy"),

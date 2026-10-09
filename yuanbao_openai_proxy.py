@@ -2575,7 +2575,13 @@ async def login_reset(req: Request):
     import cdp_minter
     m = cdp_minter.get_minter()
     try:
-        r = await asyncio.to_thread(m.reset_login)
+        _b = {}
+        try:
+            _b = await req.json()
+        except Exception:
+            _b = {}
+        # new_device=True ⇒ 连设备指纹一起清（多号指纹隔离用）
+        r = await asyncio.to_thread(m.reset_login, bool(_b.get("new_device")))
         # 换号后必须重新判定无水印状态（旧号的结论不适用于新号）
         _WATERMARK.update({"at": 0, "ok": None, "enabled": None,
                            "detail": "登录态已重置，待新号登录后自动补开", "attempts": 0})

@@ -131,6 +131,64 @@ _UNUSED_FP_JS = """
 """
 
 
+# 登录页编排：确保"有一个**新鲜**的二维码"再截图。
+#
+# 🔴 背景（踩过的坑）：老实现每次都用 textContent==='登录' 找按钮，并用
+#   `.hyc-login-v2,.hyc-phone-login` 做"弹窗已开"的守卫判断。但站点改版后真实容器类名是
+#   `.hyc-login__content` —— 守卫永远命中不了 ⇒ **每次刷新都重点一次「登录」**，
+#   反复重建 qrconnect iframe（nonce 每次都变）⇒ 用户刚扫上二维码就失效，
+#   表现就是"扫码没反应"。所以这里改成**按二维码 iframe 是否存在/是否过期**来判断，
+#   只在缺失或超龄时才重开弹窗；找不到入口则由上层整页重载兜底。
+QR_ENSURE_JS = """
+(async () => {
+  const sleep = (ms) => new Promise(function (r) { setTimeout(r, ms); });
+  const T = function (e) { return ((e && e.textContent) || '').trim(); };
+  const cands = function () {
+    return Array.prototype.slice.call(document.querySelectorAll('*'))
+      .filter(function (e) { return e.offsetWidth > 0 && e.children.length <= 2; });
+  };
+  const byText = function (ts) {
+    return cands().filter(function (e) { return ts.indexOf(T(e)) >= 0; })
+      .sort(function (a, b) { return (a.offsetWidth * a.offsetHeight) - (b.offsetWidth * b.offsetHeight); })[0];
+  };
+  const qr = function () {
+    return Array.prototype.slice.call(document.querySelectorAll('iframe'))
+      .filter(function (f) { const s = f.getAttribute('src') || ''; return s.indexOf('qrconnect') >= 0 || s.indexOf('open.weixin') >= 0; })[0];
+  };
+  const ageOf = function (f) {
+    const m = f && ((f.getAttribute('src') || '').match(/ts=(\\d+)/));
+    return m ? Date.now() - Number(m[1]) : -1;
+  };
+  const out = { logged: document.cookie.indexOf('hy_user=') >= 0, steps: [] };
+  if (out.logged) { out.state = 'logged-in'; return out; }
+
+  const want = __TAB__ === 'phone' ? ['手机', 'Phone'] : ['微信', 'WeChat'];
+  let f = qr(), age = ageOf(f);
+  out.before = { has_qr: !!f, age_ms: age };
+
+  if (f && age > __MAXAGE__) {                       // 二维码超龄 → 关掉重开，换新码
+    const x = document.querySelector('.t-dialog__close') ||
+              document.querySelector('[class*="dialog__close"]') ||
+              document.querySelector('[class*="dialog-close"]') ||
+              byText(['\u2715', '\u00d7', '\u5173\u95ed']);
+    if (x && x.click) { x.click(); out.steps.push('close-stale'); await sleep(900); }
+    f = qr();
+  }
+  if (!f) {                                          // 没有二维码 → 打开登录弹窗
+    const b = byText([__LOGIN_TXT__]);
+    if (b && b.click) { b.click(); out.steps.push('open'); await sleep(1800); }
+  }
+  if (!qr()) { out.reload = true; return out; }       // 仍然没有 → 让上层整页重载兜底
+
+  const t = byText(want);                             // 切到目标登录方式
+  if (t && t.click) { t.click(); out.steps.push('tab'); await sleep(1600); }
+  out.after = { has_qr: !!qr(), age_ms: ageOf(qr()) };
+  out.state = 'qr-ready';
+  return out;
+})()
+"""
+
+
 # 登录页截图裁剪：找出"含微信二维码的最内层容器"。
 # 实测 DOM：二维码在 iframe(open.weixin.qq.com/connect/qrconnect, 200x400) 里，
 # 其最内层容器是 .hyc-login__content(460x440)；同层的 .hyc-login__left(240x440) 是推广面板，
@@ -414,21 +472,35 @@ class CDPMinter:
         with self._lock:
             ws = self._ensure_page()
             if tab in ("wechat", "phone"):
-                names = "['微信','WeChat']" if tab == "wechat" else "['手机','Phone']"
-                self._eval_on(ws, (
-                    "(() => { const b=[...document.querySelectorAll('*')]"
-                    ".filter(e=>e.offsetWidth>0&&e.children.length<=2"
-                    "&&['登录','Log In'].includes((e.textContent||'').trim()))"
-                    ".sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0];"
-                    " if(b && !document.querySelector('.hyc-login-v2,.hyc-phone-login')) b.click(); return 'ok'; })()"
-                ), 30, mid=31)
-                self._eval_on(ws, (
-                    f"(() => {{ const c=[...document.querySelectorAll('*')]"
-                    f".filter(e=>e.offsetWidth>0&&e.children.length<=2&&{names}.includes((e.textContent||'').trim()))"
-                    f".sort((a,b)=>(a.offsetWidth*a.offsetHeight)-(b.offsetWidth*b.offsetHeight))[0];"
-                    f" if(c) c.click(); return 'ok'; }})()"
-                ), 30, mid=32)
-                time.sleep(2)
+                js = (QR_ENSURE_JS
+                      .replace("__TAB__", json.dumps(tab))
+                      .replace("__MAXAGE__", "240000")
+                      .replace("__LOGIN_TXT__", "['\u767b\u5f55', 'Log In']"))
+                st = self._eval_on(ws, js, 40, mid=31)
+                if isinstance(st, dict) and st.get("reload"):
+                    # 连登录入口都找不到：整页重载兜底（仅在未登录时走到这里）
+                    print("[login] 未找到登录入口，整页重载以重新生成二维码", flush=True)
+                    try:
+                        self._ws_send(ws, "Page.reload", {"ignoreCache": False}, mid=36)
+                    except Exception:
+                        pass
+                    time.sleep(4)
+                    for _ in range(45):
+                        try:
+                            r = self._ws_send(ws, "Runtime.evaluate", {
+                                "expression": "Object.keys(window).some(k=>k.startsWith('webpackChunk')) "
+                                              "&& window.webpackChunk_N_E && window.webpackChunk_N_E.length>3",
+                                "returnByValue": True}, mid=37)
+                        except Exception:
+                            break
+                        if r.get("result", {}).get("value"):
+                            break
+                        time.sleep(1)
+                    time.sleep(3)
+                    self._eval_on(ws, js, 40, mid=31)
+                    time.sleep(1)
+                elif isinstance(st, dict):
+                    print("[login] tab=%s state=%s %s" % (tab, st.get("state"), st.get("steps")), flush=True)
             ws.settimeout(timeout_s)
             # 尽量只截"登录弹窗"区域并放大 2x：整页截图里二维码太小，手机扫不出来
             params = {"format": "png"}

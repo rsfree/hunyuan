@@ -18,6 +18,8 @@ services:
       - ./auths/${YB_INSTANCE_NAME:-acc01}/stats:/data/stats
       # 号池账号状态（启用/禁用/隔离/剔除），跟着账号走
       - ./auths/${YB_INSTANCE_NAME:-acc01}/state:/data/state
+      # 号池共享注册表：加号只需写这个文件，各实例按 mtime 热重载，**无需重启**
+      - ../pool.json:/data/pool.json:ro
     environment:
       YUANBAO_API_KEY: "${YUANBAO_API_KEY}"
       # 号池内部只读 key（各实例共享）：让任一实例都能查到整池状态；不能当 API key 用
@@ -30,7 +32,8 @@ services:
       YB_AUTO_WATERMARK: "${YB_AUTO_WATERMARK:-1}"
       # 号池生命周期自动规则 + 轮询入口
       YB_AUTO_DISABLE_AFTER: "${YB_AUTO_DISABLE_AFTER:-3}"
-      YB_AUTO_REENABLE_AFTER: "${YB_AUTO_REENABLE_AFTER:-3}"
+      # 默认 1：一次成功保活即回池（设 3 配合 15 分钟周期＝要等 45 分钟，新号会"迟迟不进号池"）
+      YB_AUTO_REENABLE_AFTER: "${YB_AUTO_REENABLE_AFTER:-1}"
       YB_AUTO_EJECT_AFTER_DAYS: "${YB_AUTO_EJECT_AFTER_DAYS:-0}"
       YB_ROUTER: "${YB_ROUTER:-1}"
       # 构建版本（update-service.sh 注入 git describe），可用 /admin/version 核对线上版本

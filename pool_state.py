@@ -101,16 +101,23 @@ class AccountState:
             if action == "note":
                 self._d["notes"] = reason[:400]
             elif action == "enable":
-                self._d.update({"state": "enabled", "reason": reason or "手动启用"})
+                # 🔴 必须复位失败计数：否则下一个保活周期按旧的 fail_streak 立刻把它打回隔离，
+                # 用户看到的就是"我明明点了启用，它自己又变回隔离了"（实测踩过）。
+                self._d.update({"state": "enabled", "reason": reason or "手动启用",
+                                "fail_streak": 0, "ok_streak": 0})
             elif action == "restore":   # 从剔除态恢复
-                self._d.update({"state": "enabled", "reason": reason or "手动恢复"})
+                self._d.update({"state": "enabled", "reason": reason or "手动恢复",
+                                "fail_streak": 0, "ok_streak": 0})
             elif action == "disable":
                 self._d.update({"state": "disabled", "reason": reason or "手动禁用"})
             elif action == "eject":
                 self._d.update({"state": "ejected", "reason": reason or "手动剔除"})
-            elif action == "reset":     # 清空健康计数并启用
+            elif action == "reset":     # 重来一遍：连历史健康结论一起清掉
+                # 只清计数是不够的：ever_ok 留着 True 会让"退出登录 → 保活失败"按老号规则
+                # 快速累积到自动隔离。reset 语义就是"当作新号重来"。
                 self._d.update({"state": "enabled", "reason": reason or "手动重置",
-                                "fail_streak": 0, "ok_streak": 0})
+                                "fail_streak": 0, "ok_streak": 0,
+                                "ever_ok": False, "last_health": None})
             self._d["changed_at"] = int(time.time())
             self._d["changed_by"] = by
             if action != "note":
@@ -119,15 +126,21 @@ class AccountState:
         return {"ok": True, "state": self.get()}
 
     # ---------- 自动规则 ----------
-    def record_health(self, ok: bool, status=None, detail: str = "", frozen: bool = False):
-        """保活观测 → 自动隔离 / 自动恢复 / 超期剔除。返回 (当前状态字典, 本次自动动作)。"""
+    def record_health(self, ok: bool, status=None, detail: str = "", frozen: bool = False,
+                      count_failure: bool = True):
+        """保活观测 → 自动隔离 / 自动恢复 / 超期剔除。返回 (当前状态字典, 本次自动动作)。
+
+        `count_failure=False` 用于**配置态**失败（如"还没登录"）：这种不算健康故障，
+        只记录观测、不计失败、不自动隔离 —— 账号本来就会因为"未健康"被路由门禁排除，
+        再叠一层隔离只会制造噪音和来回抖动。
+        """
         act = None
         with self._lock:
             self._d["last_health"] = {"at": int(time.time()), "ok": bool(ok), "status": status,
                                       "detail": detail[:200], "frozen": bool(frozen)}
             if ok:
                 self._d["ever_ok"] = True
-            elif not self._d.get("ever_ok"):
+            elif (not count_failure) or (not self._d.get("ever_ok")):
                 # 🔴 从未成功过（＝还没扫码登录过的新实例）不计失败、不自动隔离。
                 # 否则刚 add-account 出来的号会在 3 个保活周期后被误隔离，反而更难上手。
                 self._save()

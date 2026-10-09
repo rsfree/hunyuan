@@ -2500,6 +2500,10 @@ QR_HTML = """<!DOCTYPE html>
     </div>
     <div class="muted" id="linkHint"></div>
   </div>
+  <div class="muted" style="text-align:left;margin-top:6px">
+    链接用法：复制 → <b>发到微信「文件传输助手」</b> → 在<b>手机上点开那条消息</b> → 点「确认登录」。<br>
+    ⚠️ <b>必须用微信打开</b>：用电脑/手机普通浏览器打开只会显示「请在微信客户端打开」。
+  </div>
   <div class="status" id="st">等待 Key…</div>
   <div class="muted" id="tip">用微信扫码完成登录 · 自动刷新 · 已登录后此处显示当前页面</div>
 </div>

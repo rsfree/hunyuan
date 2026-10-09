@@ -30,9 +30,14 @@ if not CHROME_BIN:
             break
 CDP_YB_URL = os.environ.get("CDP_YB_URL", "https://yuanbao.tencent.com/chat/naQivTmsDa")
 CHROME_PROFILE_DIR = os.environ.get("CHROME_PROFILE_DIR", "/data/chrome-profile")  # 与 entrypoint 保持一致（登录态所在）
-# 设备指纹种子：注入已知账号绑定的设备身份（避免 headless 新指纹触发风控）
-# 格式 "k1=v1;k2=v2"（localStorage 键值对）
-DEVICE_SEED = os.environ.get("YB_DEVICE_SEED", "_qimei_h38=e9632faf082420cd40bb971703000001419610")
+# 设备指纹种子：**默认不注入**，让每个 profile 自己生成设备身份。
+#
+# 🔴 历史教训：这里原本硬编码了一个固定的 `_qimei_h38`，导致**所有实例共用同一设备指纹**，
+#   等于把多个账号绑在同一条设备线上（一封全封）。改为默认空 ⇒ 各实例自然隔离。
+#   已登录账号不受影响：SEED_JS 只是 localStorage 的一次写入，一旦写入就留在 profile 里，
+#   不再注入并不会抹掉既有值（所以老号不会因这次改动掉登录）。
+#   需要显式绑定时再设 YB_DEVICE_SEED="k1=v1;k2=v2"（一般不要设）。
+DEVICE_SEED = os.environ.get("YB_DEVICE_SEED", "").strip()
 STEALTH_JS = """
 (() => {
   // 平台/语言与 UA 保持一致（Mac Chrome zh-CN）
@@ -66,6 +71,7 @@ SEED_JS = """
     const i = p.indexOf("=");
     if (i > 0) localStorage.setItem(p.slice(0, i), p.slice(i + 1));
   }
+  // 种子为空 ⇒ 什么都不写，交给页面 SDK 自己生成（各实例因此天然隔离）
   return localStorage.getItem("_qimei_h38") || "";
 })()
 """.replace("__SEED__", DEVICE_SEED)
@@ -152,8 +158,15 @@ QR_ENSURE_JS = """
       .sort(function (a, b) { return (a.offsetWidth * a.offsetHeight) - (b.offsetWidth * b.offsetHeight); })[0];
   };
   const qr = function () {
+    // 🔴 必须是**可见**的二维码 iframe：切到手机号 Tab 后微信 iframe 仍留在 DOM 里但被隐藏，
+    // 只按 src 判断会误以为"二维码已就绪"，于是切 Tab 永远不生效（踩过）
     return Array.prototype.slice.call(document.querySelectorAll('iframe'))
-      .filter(function (f) { const s = f.getAttribute('src') || ''; return s.indexOf('qrconnect') >= 0 || s.indexOf('open.weixin') >= 0; })[0];
+      .filter(function (f) {
+        const s = f.getAttribute('src') || '';
+        if (s.indexOf('qrconnect') < 0 && s.indexOf('open.weixin') < 0) return false;
+        const r = f.getBoundingClientRect();
+        return r.width > 50 && r.height > 50;
+      })[0];
   };
   const ageOf = function (f) {
     const m = f && ((f.getAttribute('src') || '').match(/ts=(\\d+)/));
@@ -465,42 +478,85 @@ class CDPMinter:
                 return res.get("result", {}).get("value")
         raise TimeoutError("eval 超时")
 
-    def screenshot(self, tab: str = None, timeout_s: int = 60) -> bytes:
+    def _ensure_login_ready(self, ws, tab: str):
+        """确保目标登录方式的界面就绪（必要时重开弹窗）。返回编排结果；capture=False 时上层只取它。"""
+        js = (QR_ENSURE_JS
+              .replace("__TAB__", json.dumps(tab))
+              .replace("__MAXAGE__", "240000")
+              .replace("__LOGIN_TXT__", "['\\u767b\\u5f55', 'Log In']"))
+        st = self._eval_on(ws, js, 40, mid=31)
+        if isinstance(st, dict) and st.get("reload"):
+            print("[login] 未找到登录入口，整页重载以重新生成二维码", flush=True)
+            try:
+                self._ws_send(ws, "Page.reload", {"ignoreCache": False}, mid=36)
+            except Exception:
+                pass
+            time.sleep(4)
+            for _ in range(45):
+                try:
+                    r = self._ws_send(ws, "Runtime.evaluate", {
+                        "expression": "Object.keys(window).some(k=>k.startsWith('webpackChunk')) "
+                                      "&& window.webpackChunk_N_E && window.webpackChunk_N_E.length>3",
+                        "returnByValue": True}, mid=37)
+                except Exception:
+                    break
+                if r.get("result", {}).get("value"):
+                    break
+                time.sleep(1)
+            time.sleep(3)
+            st = self._eval_on(ws, js, 40, mid=31)
+            time.sleep(1)
+        elif isinstance(st, dict):
+            print("[login] tab=%s state=%s %s" % (tab, st.get("state"), st.get("steps")), flush=True)
+        return st
+
+    def wechat_login_url(self) -> dict:
+        """取微信登录的**可点击授权链接**（= 二维码里编码的那个 URL），可免扫码。
+
+        原理：微信 qrconnect 二维码的内容就是 `https://open.weixin.qq.com/connect/confirm?uuid=xxx`。
+        把 uuid 从 iframe 里读出来拼成链接 ⇒ 发到手机微信里点开即可授权。
+        """
+        try:
+            d = json.loads(urllib.request.urlopen(CDP_HTTP + "/json/list", timeout=8).read())
+        except Exception as e:
+            return {"error": "CDP 不可达: %s" % str(e)[:80]}
+        tgt = next((t for t in d if t.get("type") == "iframe"
+                    and "qrconnect" in (t.get("url") or "")), None)
+        if not tgt:
+            return {"error": "当前没有微信二维码（请先切到微信 Tab）"}
+        uuid = ""
+        try:
+            ws = websocket.create_connection(tgt["webSocketDebuggerUrl"], timeout=15, suppress_origin=True)
+            ws.settimeout(15)
+            expr = "(document.documentElement.outerHTML.match(/uuid=([A-Za-z0-9_\\-]+)/)||[])[1]||''"
+            ws.send(json.dumps({"id": 1, "method": "Runtime.evaluate",
+                                "params": {"expression": expr, "returnByValue": True}}))
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                m = json.loads(ws.recv())
+                if m.get("id") == 1:
+                    uuid = m.get("result", {}).get("result", {}).get("value") or ""
+                    break
+            ws.close()
+        except Exception as e:
+            return {"error": "读取 uuid 失败: %s" % str(e)[:80]}
+        if not uuid:
+            return {"error": "未取到 uuid（二维码可能已过期，刷新后重试）"}
+        return {"uuid": uuid,
+                "url": "https://open.weixin.qq.com/connect/confirm?uuid=" + uuid,
+                "hint": "把这个链接发到手机微信里（发给「文件传输助手」最方便），在微信内置浏览器点开 → "
+                        "点「确认登录」即可，无需扫码。链接约 5 分钟内有效，过期后刷新本页重新生成。"}
+
+    def screenshot(self, tab: str = None, timeout_s: int = 60, capture: bool = True):
         """登录页截图：可选先切到 wechat/phone 登录方式。整段（切页 + 截图）持同一把锁，
         对外是一个原子 CDP 会话 —— 上层只需 asyncio.to_thread(m.screenshot, tab)。"""
         import base64
         with self._lock:
             ws = self._ensure_page()
             if tab in ("wechat", "phone"):
-                js = (QR_ENSURE_JS
-                      .replace("__TAB__", json.dumps(tab))
-                      .replace("__MAXAGE__", "240000")
-                      .replace("__LOGIN_TXT__", "['\u767b\u5f55', 'Log In']"))
-                st = self._eval_on(ws, js, 40, mid=31)
-                if isinstance(st, dict) and st.get("reload"):
-                    # 连登录入口都找不到：整页重载兜底（仅在未登录时走到这里）
-                    print("[login] 未找到登录入口，整页重载以重新生成二维码", flush=True)
-                    try:
-                        self._ws_send(ws, "Page.reload", {"ignoreCache": False}, mid=36)
-                    except Exception:
-                        pass
-                    time.sleep(4)
-                    for _ in range(45):
-                        try:
-                            r = self._ws_send(ws, "Runtime.evaluate", {
-                                "expression": "Object.keys(window).some(k=>k.startsWith('webpackChunk')) "
-                                              "&& window.webpackChunk_N_E && window.webpackChunk_N_E.length>3",
-                                "returnByValue": True}, mid=37)
-                        except Exception:
-                            break
-                        if r.get("result", {}).get("value"):
-                            break
-                        time.sleep(1)
-                    time.sleep(3)
-                    self._eval_on(ws, js, 40, mid=31)
-                    time.sleep(1)
-                elif isinstance(st, dict):
-                    print("[login] tab=%s state=%s %s" % (tab, st.get("state"), st.get("steps")), flush=True)
+                st = self._ensure_login_ready(ws, tab)
+                if not capture:
+                    return st
             ws.settimeout(timeout_s)
             # 尽量只截"登录弹窗"区域并放大 2x：整页截图里二维码太小，手机扫不出来
             params = {"format": "png"}

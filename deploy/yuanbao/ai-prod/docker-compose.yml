@@ -50,3 +50,11 @@ services:
       YB_PROXY_POOL: "${YB_PROXY_POOL:-}"
       # 浏览器侧（铸签/扫码/接码登录）：经本地 socks 桥走 2089（域名哈希恒定出口，更像真人会话）
       YB_BROWSER_PROXY: "${YB_BROWSER_PROXY:-}"
+    # 实例间互通（号池聚合 / 批量运维 / 跨实例代理）走这个共享网络，用容器名寻址
+    networks:
+      - yuanbao-net
+
+networks:
+  yuanbao-net:
+    external: true
+    name: yuanbao-net

@@ -248,3 +248,50 @@ curl -X POST -H "Authorization: Bearer $K" -H 'content-type: application/json' \
 
 新号登录后由保活循环 + `/admin/state` **自动补开**（`YB_AUTO_WATERMARK=1`，默认开）；幂等，已开则不写。
 换成新号（`/login/reset`）会清空判定，登录后重新补开。
+
+## 十一、实例间互通：共享网络 + 跨实例代理
+
+**共享 docker 网络 `yuanbao-net`**：所有实例加入同一个 external 网络，彼此用**容器名**寻址。
+好处是 peer 之间不必依赖公网域名 / 回环端口（回环端口容器访问不到）。
+
+```
+YB_POOL_PEERS=acc01=https://yuanbao.1task.cn,acc02=http://yuanbao-acc02:39177
+                                                    └─ 容器名，走 yuanbao-net
+```
+
+网络由脚本自动确保存在：`docker network inspect yuanbao-net || docker network create yuanbao-net`
+
+**跨实例管理代理**（一个入口管所有号，`/pool/peer/<名字>/<路径>`）：
+
+```bash
+# 打开 acc02 的扫码页（登录那个号）
+https://yuanbao.1task.cn/pool/peer/acc02/qr?k=<任一实例key>
+# 读 acc02 的状态 / 版本
+curl -H "Authorization: Bearer <key>" https://yuanbao.1task.cn/pool/peer/acc02/admin/version
+```
+
+- 🔴 **只按名字**从 `YB_POOL_PEERS` 查目标，**绝不接受 URL**（防 SSRF）
+- 转发用 `YB_FLEET_KEY`；因此登录相关端点（`/login`、`/login/phone/*`、`/login/reset`）
+  也归入管理面鉴权，fleet key 可用
+- HTML 响应会注入垫片，把页面里的站内绝对路径请求改写到该 peer 前缀。
+  **覆盖 fetch / XHR / `img.src` 直接赋值三处** —— 漏掉 `img.src` 会导致二维码图片仍从
+  本实例取（本实例已登录时就会显示成"已登录页面"而不是二维码）。已实测踩过。
+
+> 所以：**多号不需要每个号都配公网域名**。管理面走一个入口即可；
+> 只有需要被 new-api 当独立渠道直连时，才给某个号配域名。
+
+## 十二、路由健康门禁与新号冷启动
+
+**门禁**：`/pool/v1/*` 只会把请求发给 **`state=enabled` 且最近一次保活成功** 的实例。
+
+只判 `enabled` 是不够的 —— 刚 `add-account` 出来还没扫码登录的实例也是 `enabled`，
+把它算进轮询只会把请求打到一个用不了的号上。
+
+**新号冷启动（避免"等一个保活周期"）**：
+- 进程内保活循环启动后 **15s** 就做第一次（原来是 60s）
+- `/admin/state` 被轮询时，若发现**已登录但还没有过成功保活**，立刻补一次保活并落状态
+  ⇒ 扫码登录后**约 20s 内**该号即可参与轮询
+
+**新实例不被误隔离**：状态机有 `ever_ok` 标记 —— **从未成功保活过**的实例
+（＝还没扫码登录）不计失败次数、不自动隔离。否则刚加出来的号会在 3 个周期后被隔离，
+反而更难上手。一旦成功过一次，规则立刻恢复正常。

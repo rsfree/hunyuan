@@ -86,7 +86,15 @@ except Exception:
     data = {"peers": []}
 peers = data.setdefault("peers", [])
 peers = [p for p in peers if p.get("name") != name]
-peers.append({"name": name, "url": url, "port": port})
+# 轮询转发需要目标实例自己的 API key（/v1 只认实例 key）
+kf = os.path.join(root, ".env." + name)
+key = ""
+if os.path.exists(kf):
+    for ln in open(kf, encoding="utf-8"):
+        if ln.startswith("YUANBAO_API_KEY="):
+            key = ln.split("=", 1)[1].strip()
+            break
+peers.append({"name": name, "url": url, "port": port, "key": key})
 data["peers"] = sorted(peers, key=lambda x: x.get("name", ""))
 os.makedirs(os.path.dirname(path), exist_ok=True)
 json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)

@@ -22,6 +22,8 @@ services:
       - ../pool.json:/data/pool.json:ro
       # 自动加号的"意向文件"通道：页面只写请求，特权动作由宿主机 pool-provisioner 执行
       - ../requests:/data/requests
+      # C 方案「分组共享」：组内 cookie 账号库（账号只存 cookie，不再各养一个浏览器）
+      - ./auths/${YB_INSTANCE_NAME:-acc01}/accounts:/data/accounts
       - ../results:/data/results:ro
     environment:
       YUANBAO_API_KEY: "${YUANBAO_API_KEY}"
@@ -50,7 +52,8 @@ services:
       #    进程内锁（_bsk_lock 不跨进程）⇒ 多 worker = 多个重复标签页 + 无互斥（截图/会话错乱）
       YB_WORKERS: "${YB_WORKERS:-1}"
       YB_INSTANCE_NAME: "${YB_INSTANCE_NAME:-acc01}"
-      YB_BASE_URL: "${YB_BASE_URL:-https://yuanbao.1task.cn}"
+      # ⚠️ 不要给默认域名：多实例共用一个默认值会让自身识别出错（见代码注释）
+      YB_BASE_URL: "${YB_BASE_URL:-}"
       # 号池总览数据源：把**所有**实例列进来（含自己），任一实例都能看到整池
       YB_POOL_PEERS: "${YB_POOL_PEERS:-acc01=https://yuanbao.1task.cn}"
       # === 代理池（凭据只放 .env，绝不入库）===

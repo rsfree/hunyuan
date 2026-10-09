@@ -2317,6 +2317,8 @@ async def admin_group_op(req: Request):
     action:
       capture — **把当前浏览器的登录态存成一个账号**（扫码登录后点一下即可）；
                 可选 name（默认自动 ybNN）、note
+      add     — **直接粘贴 cookie 加号**：body 带 cookie（含 hy_user 的完整串），
+                可来自任意浏览器/抓包，不要求本实例浏览器已登录
       remove  — 删除账号
       enable / disable / reset / eject — 生命周期（复用状态机，规则与实例账号一致）
       keepalive — 立刻用该账号 cookie 探活一次
@@ -2363,6 +2365,33 @@ async def admin_group_op(req: Request):
         return {"result": {"ok": True, "name": name, "replaced": r.get("replaced"),
                            "cookie_len": r.get("cookie_len"), "health": detail, "http": st},
                 "hint": "已存为本组账号；可再点「重置登录态」清掉浏览器登录态，接着扫下一个号"}
+
+    if action == "add":
+        # 直接粘贴 cookie 加号（cookie 可来自任意浏览器/抓包，不要求本实例的浏览器已登录）
+        cookie = (body.get("cookie") or "").strip()
+        if not cookie:
+            return JSONResponse({"error": "缺少 cookie（需要含 hy_user 的完整 cookie 串）"}, status_code=400)
+        if not name:
+            existing = {x["name"] for x in COOKIE_ACCOUNTS.list()}
+            i = 1
+            while ("yb%02d" % i) in existing:
+                i += 1
+            name = "yb%02d" % i
+        r = COOKIE_ACCOUNTS.add(name, cookie, note)
+        if not r.get("ok"):
+            return JSONResponse({"error": r.get("error")}, status_code=400)
+        st, detail = 0, ""
+        try:
+            ck = COOKIE_ACCOUNTS.cookie(name)
+            st, body_txt = await asyncio.to_thread(_keepalive_probe_sync, ck)
+            detail = "alive" if st == 200 else ("HTTP %s" % st)
+            COOKIE_ACCOUNTS.record_health(name, st == 200, st, detail)
+            if st == 200 and YB_AUTO_WATERMARK:
+                await asyncio.to_thread(_wm_ensure_cookie, ck, True)
+        except Exception as e:
+            detail = "探活异常: %s" % str(e)[:80]
+        return {"result": {"ok": True, "name": name, "added": True, "replaced": r.get("replaced"),
+                           "cookie_len": r.get("cookie_len"), "health": detail, "http": st}}
 
     if not name:
         return JSONResponse({"error": "缺少 name"}, status_code=400)
@@ -3211,6 +3240,7 @@ MANAGE_HTML = """<!DOCTYPE html>
   <button class="ghost" onclick="batch('state')">批量查状态</button>
   <button onclick="addAccount()" id="addBtn" style="border-color:#3B6D11;background:#3B6D11">＋ 新建分组实例</button>
   <button onclick="captureAccount()" id="capBtn" style="border-color:#185FA5;background:#185FA5">💾 保存当前登录为账号</button>
+  <button onclick="pasteCookie()" id="pasteBtn" class="ghost">📋 粘贴 cookie 加号</button>
 </div>
 <div id="opMsg" class="muted" style="margin-bottom:12px"></div>
 
@@ -3378,6 +3408,24 @@ async function act(name, action, kind) {
     const d = await r.json();
     $('opMsg').innerHTML = d.error ? '<span class="err-txt">' + esc(d.error) + '</span>'
       : '已对 <b>' + esc(name) + '</b> 执行 <b>' + esc(action) + '</b>';
+    load();
+  } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+async function pasteCookie() {
+  if (!KEY) { $('opMsg').innerHTML = '<span class="err-txt">请先填写门禁 Key</span>'; return; }
+  const ck = prompt('粘贴完整 cookie 串（需含 hy_user=...）:');
+  if (!ck || !ck.trim()) return;
+  const nm = prompt('给这个账号起个名（留空=自动 ybNN）:', '') || '';
+  $('opMsg').textContent = '正在加入并探活…';
+  try {
+    const r = await fetch('/admin/group', { method: 'POST', headers: H(),
+      body: JSON.stringify({ action: 'add', cookie: ck.trim(), name: nm.trim() }) });
+    const d = await r.json();
+    if (d.error) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(d.error) + '</span>'; return; }
+    const x = d.result || {};
+    $('opMsg').innerHTML = '\u2705 已加入 <b>' + esc(x.name) + '</b>（cookie ' + x.cookie_len
+      + ' 字节 · 探活 ' + esc(String(x.health)) + '）';
     load();
   } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
 }

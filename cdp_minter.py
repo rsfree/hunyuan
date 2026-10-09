@@ -614,7 +614,7 @@ class CDPMinter:
         except Exception as e:
             return {"error": str(e)[:120]}
 
-    def reset_login(self) -> dict:
+    def reset_login(self, new_device: bool = False) -> dict:
         """重置登录态：清浏览器 cookie + localStorage（**保留设备种子 _qimei_h38**）+ 重载页面。
 
         账号被冻结 / 要换账号登录时必须先做这一步：冻结态页面没有"登录"按钮，
@@ -624,10 +624,13 @@ class CDPMinter:
             ws = self._ensure_page()
             self._ws_send(ws, "Network.enable", {}, mid=51)
             self._ws_send(ws, "Network.clearBrowserCookies", {}, mid=52)
+            # new_device=True：连设备指纹一起清 ⇒ 页面 SDK 会重新生成一个**全新且独立**的设备身份。
+            # 这是"多号指纹隔离"的关键一步：旧实现刻意保留 _qimei_h38，导致所有实例共用同一个指纹。
             self._eval_on(ws, (
                 "(() => { const k = localStorage.getItem('_qimei_h38');"
-                " localStorage.clear(); if (k) localStorage.setItem('_qimei_h38', k);"
-                " return 'ok'; })()"
+                + (" localStorage.clear();" if new_device else
+                   " localStorage.clear(); if (k) localStorage.setItem('_qimei_h38', k);")
+                + " return 'ok'; })()"
             ), 20, mid=53)
             try:
                 self._ws_send(ws, "Page.navigate", {"url": CDP_YB_URL}, mid=54)

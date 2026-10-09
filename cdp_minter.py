@@ -193,8 +193,17 @@ QR_ENSURE_JS = """
   }
   if (!qr()) { out.reload = true; return out; }       // 仍然没有 → 让上层整页重载兜底
 
-  const t = byText(want);                             // 切到目标登录方式
-  if (t && t.click) { t.click(); out.steps.push('tab'); await sleep(1600); }
+  // 🔴 只有"当前 Tab 不是目标 Tab"时才点它！
+  // 切 Tab 会**清空已填的表单**（手机号/验证码/协议勾选）——之前每次截图都盲点一次，
+  // 导致用户填好号点完发送、页面一刷新就被清空，表现为"手机号登录有问题"。实测踩过。
+  const isPhone = function () { return !!document.querySelector('.hyc-phone-login'); };
+  const active = (__TAB__ === 'phone') ? isPhone() : !!qr();
+  if (!active) {
+    const t = byText(want);
+    if (t && t.click) { t.click(); out.steps.push('tab'); await sleep(1600); }
+  } else {
+    out.steps.push('tab-kept');
+  }
   out.after = { has_qr: !!qr(), age_ms: ageOf(qr()) };
   out.state = 'qr-ready';
   return out;

@@ -1783,6 +1783,28 @@ async def login_phone_verify(req: Request):
         return JSONResponse({"error": str(e)[:200]}, status_code=502)
 
 
+@app.get("/admin/login-link")
+async def admin_login_link(req: Request, prepare: int = 1):
+    """微信登录的**可点击授权链接**（免扫码）：把链接发到手机微信里点开即可授权。
+
+    原理：微信二维码编码的就是 `open.weixin.qq.com/connect/confirm?uuid=...`，
+    从 qrconnect iframe 里读出 uuid 拼出来即可。链接约 5 分钟有效。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if YB_MINT_BACKEND != "cdp":
+        return JSONResponse({"error": "仅 cdp 后端支持"}, status_code=400)
+    import cdp_minter
+    m = cdp_minter.get_minter()
+    if prepare:
+        try:
+            await asyncio.to_thread(m.screenshot, "wechat", 60, False)   # 只确保二维码就绪，不截图
+        except Exception as e:
+            return JSONResponse({"error": "准备二维码失败: %s" % str(e)[:120]}, status_code=502)
+    return {"result": await asyncio.to_thread(m.wechat_login_url)}
+
+
 @app.get("/admin/state")
 async def admin_state(req: Request):
     """容器页面状态：已登录 / 已被冻结（冻结时页面上没有"登录"按钮，必须先重置登录态）。"""
@@ -2152,6 +2174,54 @@ async def admin_account_op(req: Request):
     return {"result": out, "instance": YB_INSTANCE_NAME_ENV}
 
 
+@app.post("/admin/pool/request")
+async def admin_pool_request(req: Request):
+    """页面"添加账号"入口：写一个意向文件，宿主机侧 pool-provisioner 负责真正建实例。
+
+    容器里没有 docker socket —— 特权动作只能由宿主机做，这里只投递请求。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    name = str(body.get("name") or "").strip()
+    if name and not re.match(r"^acc[0-9]{1,3}$", name):
+        return JSONResponse({"error": "实例名只允许 acc + 数字（如 acc03）"}, status_code=400)
+    rid = "%d-%s" % (int(time.time()), uuid.uuid4().hex[:6])
+    try:
+        os.makedirs(YB_REQ_DIR, exist_ok=True)
+        tmp = os.path.join(YB_REQ_DIR, rid + ".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"id": rid, "action": "add", "name": name}, f, ensure_ascii=False)
+        os.replace(tmp, os.path.join(YB_REQ_DIR, rid + ".json"))
+    except Exception as e:
+        return JSONResponse({"error": "投递请求失败：%s（宿主目录是否可写？）" % str(e)[:120]},
+                            status_code=503)
+    return {"id": rid, "name": name or "(自动取号)", "status": "pending",
+            "hint": "宿主机 pool-provisioner 每 3 秒扫描一次，通常 20-40 秒完成"}
+
+
+@app.get("/admin/pool/request/{rid}")
+async def admin_pool_request_status(req: Request, rid: str):
+    """查询加号进度（页面轮询用）。"""
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+    if not re.match(r"^[0-9]+-[0-9a-f]{6}$", rid):
+        return JSONResponse({"error": "非法请求 id"}, status_code=400)
+    path = os.path.join(YB_RES_DIR, rid + ".json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return {"result": json.load(f)}
+    except FileNotFoundError:
+        return {"result": {"id": rid, "status": "pending", "log": ""}}
+    except Exception as e:
+        return {"result": {"id": rid, "status": "error", "log": str(e)[:200]}}
+
+
 @app.get("/admin/accounts")
 async def admin_accounts(req: Request):
     """整个号池的账号清单：状态 + 健康 + 近 24h 调用量（管理页数据源）。"""
@@ -2420,7 +2490,15 @@ QR_HTML = """<!DOCTYPE html>
     <button class="ghost" onclick="saveKey()">保存 Key</button>
   </div>
   <div class="row">
-    <button class="ghost" id="resetBtn" onclick="resetLogin()">重置登录态（清 cookie · 换账号用）</button>
+    <button class="ghost" onclick="getLoginLink()">📱 获取「免扫码」授权链接</button>
+    <button class="ghost" id="resetBtn" onclick="resetLogin()">重置登录态</button>
+  </div>
+  <div id="linkBox" style="display:none;text-align:left;margin-top:8px">
+    <input id="linkVal" readonly onclick="this.select()" style="margin:0">
+    <div class="row">
+      <button class="ghost" onclick="copyLink()">复制链接</button>
+    </div>
+    <div class="muted" id="linkHint"></div>
   </div>
   <div class="status" id="st">等待 Key…</div>
   <div class="muted" id="tip">用微信扫码完成登录 · 自动刷新 · 已登录后此处显示当前页面</div>
@@ -2615,6 +2693,31 @@ async function checkState() {
     POLL_MS = logged ? 20000 : 6000;   // 未登录时快轮询（扫码后几秒内就能反映），登录后放慢
   } catch (e) {
   } finally { POLL_BUSY = false; }
+}
+
+async function getLoginLink() {
+  if (!KEY) { st.textContent = '请先填写门禁 Key'; st.className = 'status err'; return; }
+  st.textContent = '正在生成授权链接…'; st.className = 'status';
+  try {
+    const r = await fetch('/admin/login-link', { headers: { 'Authorization': 'Bearer ' + KEY } });
+    const d = await r.json();
+    const res = d.result || d;
+    if (res.error) { st.textContent = res.error; st.className = 'status err'; return; }
+    $('linkVal').value = res.url;
+    $('linkHint').textContent = res.hint || '';
+    $('linkBox').style.display = '';
+    st.textContent = '授权链接已生成（约 5 分钟有效）'; st.className = 'status ok';
+    $('linkVal').focus(); $('linkVal').select();
+  } catch (e) { st.textContent = String(e); st.className = 'status err'; }
+}
+
+function copyLink() {
+  const v = $('linkVal'); v.focus(); v.select(); v.setSelectionRange(0, 9999);
+  let ok = false;
+  try { ok = document.execCommand('copy'); } catch (e) {}
+  if (!ok && navigator.clipboard) { navigator.clipboard.writeText(v.value); ok = true; }
+  st.textContent = ok ? '已复制 \u2713 发到手机微信里点开即可（无需扫码）' : '复制失败，请手动全选复制';
+  st.className = 'status ' + (ok ? 'ok' : 'err');
 }
 
 let RESET_ARMED = false, RESET_T = null;
@@ -2926,6 +3029,7 @@ MANAGE_HTML = """<!DOCTYPE html>
   <button class="ghost" onclick="batch('keepalive')">批量保活</button>
   <button class="ghost" onclick="batch('watermark')">批量开无水印</button>
   <button class="ghost" onclick="batch('state')">批量查状态</button>
+  <button onclick="addAccount()" id="addBtn" style="border-color:#3B6D11;background:#3B6D11">＋ 添加账号（一键）</button>
 </div>
 <div id="opMsg" class="muted" style="margin-bottom:12px"></div>
 
@@ -2935,13 +3039,14 @@ MANAGE_HTML = """<!DOCTYPE html>
 </div>
 
 <div class="card" style="border-color:#e8cfa0;background:#fdf9f3">
-  <h2>如何加新号（重要：一个实例只能装一个账号）</h2>
+  <h2>加新号（一个实例只能装一个账号）</h2>
   <div class="muted" style="text-align:left;line-height:1.9">
     账号登录态存在每个实例**自己的** Chromium profile 里，<b>一个实例只能有一个登录账号</b>。<br>
-    在同一个实例上重复扫码，只会<b>替换</b>那个号的登录态，<b>不会新增账号</b> —— 这是"扫了几个号却看不到"的原因。<br><br>
-    <b>加号就一条命令</b>（端口可省略，自动分配；会建目录 / 注册 / 直接起容器，<b>无需重启其它实例</b>）：
-    <div style="margin:6px 0"><code>cd /opt/yuanbao/build &amp;&amp; ./add-account.sh acc03</code></div>
-    然后点新账号那一行的「扫码」按钮，扫它自己的二维码即可。登录后约 20 秒自动进号池。
+    在同一个实例上重复扫码，只会<b>替换</b>那个号的登录态，<b>不会新增账号</b>。<br><br>
+    <b>① 点上面「＋ 添加账号（一键）」</b> —— 会自动建实例（acc03、acc04…）、注册进号池并启动，
+    通常 20-40 秒。完成后新账号会出现在下面清单里。<br>
+    <b>② 点它那一行的「扫码」</b>，用微信扫该号自己的二维码。登录后约 20 秒自动进池、参与轮询。<br>
+    <span class="muted">（命令行等价：<code>cd /opt/yuanbao/build &amp;&amp; ./add-account.sh acc03</code>）</span>
   </div>
 </div>
 
@@ -3063,6 +3168,48 @@ async function act(name, action) {
       : '已对 <b>' + esc(name) + '</b> 执行 <b>' + esc(action) + '</b>';
     load();
   } catch (e) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>'; }
+}
+
+let ADD_TIMER = null;
+async function addAccount() {
+  if (!KEY) { $('opMsg').innerHTML = '<span class="err-txt">请先填写门禁 Key</span>'; return; }
+  if (ADD_TIMER) return;
+  const btn = $('addBtn');
+  btn.disabled = true;
+  $('opMsg').innerHTML = '正在创建新实例… <span class="muted">（宿主机执行，约 20-40 秒）</span>';
+  let id = null;
+  try {
+    const r = await fetch('/admin/pool/request', { method: 'POST', headers: H(), body: '{}' });
+    const d = await r.json();
+    if (d.error) { $('opMsg').innerHTML = '<span class="err-txt">' + esc(d.error) + '</span>'; btn.disabled = false; return; }
+    id = d.id;
+  } catch (e) {
+    $('opMsg').innerHTML = '<span class="err-txt">' + esc(e) + '</span>';
+    btn.disabled = false;
+    return;
+  }
+  let n = 0;
+  ADD_TIMER = setInterval(async function () {
+    n++;
+    try {
+      const r = await fetch('/admin/pool/request/' + id, { headers: H() });
+      const d = (await r.json()).result || {};
+      if (d.status === 'pending') { $('opMsg').textContent = '已投递请求，等待宿主机接手…（' + (n * 2) + 's）'; return; }
+      if (d.status === 'running') { $('opMsg').textContent = '正在创建并启动实例…（' + (n * 2) + 's）'; return; }
+      clearInterval(ADD_TIMER); ADD_TIMER = null;
+      btn.disabled = false;
+      if (d.status === 'done') {
+        const qr = '/pool/peer/' + encodeURIComponent(d.name) + '/qr?k=' + encodeURIComponent(KEY);
+        $('opMsg').innerHTML = '\u2705 新账号 <b>' + esc(d.name) + '</b> 已创建并启动 —— '
+          + '<a href="' + qr + '" target="_blank"><b>点这里给它扫码登录</b></a>'
+          + '（扫完约 20 秒自动进池）';
+      } else {
+        $('opMsg').innerHTML = '<span class="err-txt">创建失败</span><pre style="white-space:pre-wrap;max-height:150px;overflow:auto;font-size:11px">'
+          + esc((d.log || '(无日志)').split('\\n').slice(-12).join('\\n')) + '</pre>';
+      }
+      load();
+    } catch (e) { /* 轮询失败继续 */ }
+  }, 2000);
 }
 
 async function batch(op) {
@@ -3309,6 +3456,9 @@ POOL_HTML = MANAGE_HTML   # /pool 与 /manage 是同一个"号池管理"页（�
 
 
 YB_POOL_FILE = os.environ.get("YB_POOL_FILE", "/data/pool.json")
+# 自动加号通道（页面写请求 → 宿主机 pool-provisioner 执行 → 写结果）
+YB_REQ_DIR = os.environ.get("YB_REQ_DIR", "/data/requests")
+YB_RES_DIR = os.environ.get("YB_RES_DIR", "/data/results")
 _POOL_CACHE = {"mtime": None, "peers": None}
 
 

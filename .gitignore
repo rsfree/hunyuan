@@ -13,3 +13,6 @@ deploy/**/.env
 
 # 登录二维码截图（含可登录凭据，绝不入库）
 qr_*.png
+
+# filter-branch 的临时工作区（切勿入库）
+.git-rewrite/

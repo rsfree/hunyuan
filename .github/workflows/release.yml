@@ -50,11 +50,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          # 打全部模块：漏一个 import 就会让附件"能下载但跑不起来"
           zip -r "dist/hunyuan-${{ steps.ver.outputs.next }}.zip" \
-            yuanbao_openai_proxy.py cookie_minimizer.py token_monitor.py \
-            image_multi_test.py image_multi_test_v2.py \
-            README.md REVERSE_NOTES.md \
-            -x '*.DS_Store'
+            *.py README.md REVERSE_NOTES.md deploy/ tools/ \
+            -x '*.DS_Store' '*.pyc' '*/__pycache__/*' '__pycache__/*' \
+               'deploy/*/ai-prod/auths/*' 'deploy/**/.env'
 
       - name: Verify artifacts
         run: |
@@ -74,12 +74,16 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY: ${{ steps.log.outputs.body }}
         run: |
           set -euo pipefail
-          gh release create '${{ steps.ver.outputs.next }}' \
-            --title 'Release ${{ steps.ver.outputs.next }}' \
-            --notes '${{ steps.log.outputs.body }}' \
-            dist/*
+          TAG='${{ steps.ver.outputs.next }}'
+          # 幂等：补跑同一个 tag 时不因 already exists 变红
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists -- skipping"; exit 0
+          fi
+          printf '%s\n' "$BODY" > /tmp/notes.md
+          gh release create "$TAG" --title "Release $TAG" --notes-file /tmp/notes.md dist/*
 
       - name: Move latest tag
         run: |

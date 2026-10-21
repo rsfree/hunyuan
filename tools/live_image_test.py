@@ -16,10 +16,21 @@ import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
-BASE = os.environ.get("YB_BASE", "https://yuanbao.example.com")
-KEY = os.environ.get("YB_KEY", "sk-yuanbao-REDACTED")
+# 🔴 本文件会随仓库公开：入口与 key 一律走环境变量，不留默认值
+BASE = os.environ.get("YB_BASE", "").rstrip("/")
+KEY = os.environ.get("YB_KEY", "")
 OUT = os.environ.get("YB_OUT", "/tmp/ybt")
 MODEL = os.environ.get("YB_MODEL", "hy-image-3.5")
+
+
+def _need() -> None:
+    """缺配置时给一句能照着做的提示，而不是抛 401（401 会被误读成 key 错）。"""
+    miss = [n for n, v in (("YB_BASE", BASE), ("YB_KEY", KEY)) if not v]
+    if miss:
+        raise SystemExit("缺少环境变量 %s。例：\n"
+                         "  YB_BASE=https://your-proxy.example.com YB_KEY=sk-xxx "
+                         "python3 tools/live_image_test.py all"
+                         % " / ".join(miss))
 
 # 全局禁用代理：本机 HTTP_PROXY 会把发往公网的请求劫走
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -231,6 +242,7 @@ def run_i2i(src: list[dict], workers: int = 2) -> list[dict]:
 
 
 def main():
+    _need()
     phase = (sys.argv[1] if len(sys.argv) > 1 else "all").lower()
     os.makedirs(OUT, exist_ok=True)
     all_recs: dict[str, list] = {}

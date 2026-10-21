@@ -1,0 +1,15 @@
+capture/
+.workbuddy/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+Clipboard_Screenshot.png
+cookie.txt
+deploy/minter_token.txt
+deploy/*/ai-prod/auths/
+cookie.txt
+deploy/**/.env
+
+# 登录二维码截图（含可登录凭据，绝不入库）
+qr_*.png

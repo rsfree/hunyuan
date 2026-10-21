@@ -1,0 +1,21 @@
+[Unit]
+Description=Yuanbao pool auto-provisioner (页面"添加账号"的执行端)
+Documentation=file:///opt/yuanbao/build/README-operations.md
+After=docker.service network-online.target
+Requires=docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 以宿主机 root 执行：建目录 / 改 pool.json / docker compose up -d
+Environment=YB_ROOT=/opt/yuanbao/build
+Environment=YB_REQ_DIR=/opt/yuanbao/requests
+Environment=YB_RES_DIR=/opt/yuanbao/results
+ExecStart=/opt/yuanbao/build/pool-provision.sh
+Restart=always
+RestartSec=3
+StandardOutput=append:/var/log/yuanbao-provision.log
+StandardError=append:/var/log/yuanbao-provision.log
+
+[Install]
+WantedBy=multi-user.target

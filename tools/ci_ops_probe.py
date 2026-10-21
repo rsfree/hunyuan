@@ -12,7 +12,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from tools.live_image_test import _dims, _req, BASE, KEY, MODEL  # noqa: E402
+from tools.live_image_test import _dims, _req, _need, BASE, KEY, MODEL  # noqa: E402
 
 OP = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -25,6 +25,7 @@ def get(url: str) -> tuple[bytes, str, int]:
 
 
 def main():
+    _need()
     cache = "/tmp/ybt/last_url.txt"
     u = ""
     if os.path.exists(cache) and "--fresh" not in sys.argv:

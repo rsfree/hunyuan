@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>元宝生图线上实测 · 2026-10-22</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#ffffff; --ink:#1a1d21; --ink2:#5a6472; --line:#e5e8ed;
+    --ok:#0f7b46; --okbg:#e8f6ee; --bad:#b42318; --badbg:#fdecea; --warn:#8a5a00; --warnbg:#fff6e0;
+    --brand:#2f5bd7;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px 20px 60px;background:var(--bg);color:var(--ink);
+       font:15px/1.65 -apple-system,BlinkMacSystemFont,"PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
+       -webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:-.3px}
+  .sub{color:var(--ink2);font-size:13.5px;margin-bottom:22px}
+  h2{font-size:17px;margin:34px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:18px 0 6px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+  .card .k{font-size:12px;color:var(--ink2);letter-spacing:.02em}
+  .card .v{font-size:24px;font-weight:650;margin-top:4px;letter-spacing:-.5px}
+  .card .n{font-size:12px;color:var(--ink2);margin-top:2px}
+  table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);
+        border-radius:12px;overflow:hidden;font-size:13.5px}
+  th{background:#fafbfc;text-align:left;font-weight:600;color:var(--ink2);padding:10px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+  td{padding:9px 12px;border-bottom:1px solid #f0f2f5;vertical-align:top}
+  tr:last-child td{border-bottom:none}
+  code{font:12.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;background:#f2f4f7;padding:1px 5px;border-radius:4px}
+  .tag{display:inline-block;font-size:11.5px;padding:1px 7px;border-radius:999px;font-weight:600}
+  .t-ok{background:var(--okbg);color:var(--ok)}
+  .t-bad{background:var(--badbg);color:var(--bad)}
+  .t-warn{background:var(--warnbg);color:var(--warn)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(230px,1fr));gap:14px;margin-top:14px}
+  figure{margin:0;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+  figure img{display:block;width:100%;height:auto;background:#eef1f4}
+  figcaption{padding:8px 11px;font-size:12px;color:var(--ink2);display:flex;justify-content:space-between;gap:8px}
+  figcaption b{color:var(--ink);font-weight:600}
+  .note{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--brand);
+        border-radius:8px;padding:12px 16px;font-size:13.5px;color:var(--ink2);margin:14px 0}
+  .note b{color:var(--ink)}
+  ul{margin:8px 0 0;padding-left:20px}
+  li{margin:5px 0}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>元宝生图 · 线上实测</h1>
+  <div class="sub">
+    2026-10-22 00:00–00:17 &nbsp;·&nbsp; <code>https://yuanbao.example.com/v1/images/{generations,edits}</code>
+    &nbsp;·&nbsp; 模型 <code>hy-image-3.5</code> &nbsp;·&nbsp; 实测号 <code>me</code> / <code>ybc2</code>（acc01 组内 cookie 号）
+  </div>
+
+  <div class="cards">
+    <div class="card"><div class="k">成功率</div><div class="v">13 / 13</div><div class="n">文生图 8 + 图生图 5，零失败</div></div>
+    <div class="card"><div class="k">文生图耗时</div><div class="v">27–59 s</div><div class="n">中位 36.4 s，并发 5</div></div>
+    <div class="card"><div class="k">图生图耗时</div><div class="v">52–211 s</div><div class="n">中位 75.6 s，比文生图慢 2–3×</div></div>
+    <div class="card"><div class="k">交付像素</div><div class="v">2K / 4K 精确</div><div class="n">修复后与请求值完全一致</div></div>
+  </div>
+
+  <h2>一、文生图（8 种比例，全部 200）</h2>
+  <table>
+    <thead><tr><th>请求 size</th><th>耗时</th><th>上游实际出图</th><th>交付像素</th><th>体积</th><th>走向</th></tr></thead>
+    <tbody>
+      <tr><td><code>1024x1024</code></td><td>39.1 s</td><td>1:1 · 2048²</td><td><span class="tag t-ok">2048 × 2048</span></td><td>5.4 MB</td><td>me</td></tr>
+      <tr><td><code>1792x1024</code></td><td>30.6 s</td><td>16:9 · 2240×1248</td><td><span class="tag t-ok">2240 × 1248</span></td><td>4.1 MB</td><td>ybc2</td></tr>
+      <tr><td><code>1024x1792</code></td><td>30.6 s</td><td>9:16 · 1248×2240</td><td><span class="tag t-ok">1248 × 2240</span></td><td>3.6 MB</td><td>ybc2</td></tr>
+      <tr><td><code>1408x1056</code></td><td>43.6 s</td><td>4:3 · 1920×1440</td><td><span class="tag t-ok">1920 × 1440</span></td><td>5.0 MB</td><td>me</td></tr>
+      <tr><td><code>1056x1408</code></td><td>58.7 s</td><td>3:4 · 1440×1920</td><td><span class="tag t-ok">1440 × 1920</span></td><td>3.9 MB</td><td>me</td></tr>
+      <tr><td><code>1920x816</code> (21:9)</td><td>27.4 s</td><td>16:9 · 2240×1248</td><td><span class="tag t-warn">2240 × 1248</span></td><td>3.8 MB</td><td>ybc2</td></tr>
+      <tr><td><code>2560x1440</code></td><td>36.4 s</td><td>2K + CI 放大</td><td><span class="tag t-ok">2560 × 1440</span></td><td>5.7 MB</td><td>me</td></tr>
+      <tr><td><code>3840x2160</code></td><td>28.2 s</td><td>2K + CI 放大</td><td><span class="tag t-ok">3840 × 2160</span></td><td>7.9 MB</td><td>ybc2</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>上游能力边界：</b>只有 <code>resolutionList = ["1.5K","2K"]</code>，没有 4K；比例也只有
+    1:1 / 4:3 / 3:4 / 16:9 / 9:16 五个槽位。所以 <b>任何请求都按 2K 提交</b>，
+    超过 2K 由图床 CI 做一级放大 —— <b>这是插值，不是 AI 超分</b>（<code>ImageSuperResolution</code> 在该桶未开通）。
+  </div>
+
+  <h2>二、图生图（单图 / 多图，全部 200）</h2>
+  <table>
+    <thead><tr><th>用例</th><th>参考图</th><th>耗时</th><th>交付像素</th><th>走向</th><th>说明</th></tr></thead>
+    <tbody>
+      <tr><td>single</td><td>1 张</td><td>137.3 s</td><td>2048 × 2048</td><td>me</td><td>风格迁移偏弱，更像"加纹理"而非重绘</td></tr>
+      <tr><td>single_wide</td><td>1 张</td><td>75.6 s</td><td>2240 × 1248</td><td>me</td><td>扩成宽幅，主体保持</td></tr>
+      <tr><td>multi2</td><td>2 张</td><td>51.5 s</td><td>2048 × 2048</td><td>ybc2</td><td>两主体自然融合</td></tr>
+      <tr><td>multi3</td><td>3 张</td><td>63.2 s</td><td>2048 × 2048</td><td>ybc2</td><td>三主体 + 自动排版成海报</td></tr>
+      <tr><td>multi_4k</td><td>2 张</td><td>210.6 s</td><td>3840 × 2160</td><td>me</td><td>多图 + 4K 放大，最慢一例</td></tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>图生图慢在排队而不是放大：</b>同样的 4K 放大，文生图 28 s、图生图 211 s ⇒ 上游对带参考图的
+    请求排队更久。<b>多图并不更慢</b>（2 张 51 s、3 张 63 s），慢的是单图那次 137 s 的抖动。
+  </div>
+
+  <h2>三、查出的两个真问题</h2>
+  <table>
+    <thead><tr><th>问题</th><th>根因</th><th>处置</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><b>4K 交付 3877×2160</b><br>比请求宽 37 px</td>
+        <td><code>imageMogr2/thumbnail/!WxHr</code> 是 <b>cover</b> 语义：上游 16:9 实际出的是 2240×1248（1.7949，不是 1.7778），按高贴合后宽自然溢出</td>
+        <td><span class="tag t-ok">已修</span> 改链式 <code>thumbnail/!WxHr|imageMogr2/gravity/center/cut/WxH</code>，实测精确到 3840×2160 / 2560×1440</td>
+      </tr>
+      <tr>
+        <td><b>21:9 请求悄悄变成 16:9</b></td>
+        <td>上游没有 21:9 槽位，<code>_size_to_ratio()</code> 按对数距离映射到最近的 16:9</td>
+        <td><span class="tag t-warn">未改</span> 这是能力边界，不报错是兼容性选择；已在响应 <code>upscale.exact=false</code> 与 note 里写明</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="note">
+    <b>踩坑记录（都做了实测验证）：</b>
+    <ul>
+      <li><code>thumbnail/!WxHr/cut/WxH</code>（用斜杠连写）会被 <b>整体忽略</b>并静默返回原图 —— CI 的链式分隔符必须是 <code>|</code></li>
+      <li>裁切只在「请求比例 ≈ 上游槽位比例（≤2%）」时做；否则硬裁会削掉主体（实测横图硬裁成 1080×1920 丢掉左右大幅画面）</li>
+      <li>本地保留 <code>4K-exact.png</code> 作证：<code>sips</code> 读取为 3840 × 2160</li>
+    </ul>
+  </div>
+
+  <h2>四、成品（点击可看原图尺寸）</h2>
+  <div class="grid">
+    <figure><img src="thumbs/4K-exact.jpg" alt="4K 精确"><figcaption><b>4K 精确裁切</b><span>3840×2160</span></figcaption></figure>
+    <figure><img src="thumbs/1x1.jpg" alt="1:1"><figcaption><b>1:1</b><span>2048²</span></figcaption></figure>
+    <figure><img src="thumbs/16x9.jpg" alt="16:9"><figcaption><b>16:9</b><span>2240×1248</span></figcaption></figure>
+    <figure><img src="thumbs/9x16.jpg" alt="9:16"><figcaption><b>9:16</b><span>1248×2240</span></figcaption></figure>
+    <figure><img src="thumbs/4x3.jpg" alt="4:3"><figcaption><b>4:3</b><span>1920×1440</span></figcaption></figure>
+    <figure><img src="thumbs/3x4.jpg" alt="3:4"><figcaption><b>3:4</b><span>1440×1920</span></figcaption></figure>
+    <figure><img src="thumbs/21x9.jpg" alt="21:9"><figcaption><b>21:9 → 16:9</b><span>被映射，如实标注</span></figcaption></figure>
+    <figure><img src="thumbs/i2i_single.jpg" alt="单图"><figcaption><b>图生图 · 单图</b><span>2048²</span></figcaption></figure>
+    <figure><img src="thumbs/i2i_multi2.jpg" alt="双图融合"><figcaption><b>图生图 · 双图</b><span>2048²</span></figcaption></figure>
+    <figure><img src="thumbs/i2i_multi3.jpg" alt="三图融合"><figcaption><b>图生图 · 三图海报</b><span>2048²</span></figcaption></figure>
+    <figure><img src="thumbs/i2i_multi_4k.jpg" alt="多图4K"><figcaption><b>图生图 · 多图 4K</b><span>3840×2160</span></figcaption></figure>
+    <figure><img src="thumbs/i2i_single_wide.jpg" alt="宽幅"><figcaption><b>图生图 · 扩宽幅</b><span>2240×1248</span></figcaption></figure>
+  </div>
+
+  <h2>五、复现命令</h2>
+  <div class="note" style="font-family:ui-monospace,Menlo,monospace;font-size:12.5px;line-height:1.9">
+    cd reverse/hunyuan<br>
+    python tools/live_image_test.py all &nbsp;&nbsp;# 文生图 8 例 + 图生图 5 例，落盘 /tmp/ybt<br>
+    python tools/ci_ops_probe.py &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;# 复验 CI 算符（'|' 链式 cut）
+  </div>
+
+</div>
+</body>
+</html>

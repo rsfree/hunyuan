@@ -172,8 +172,32 @@ def b5():
             setattr(ybp, k, v)
 
 
+def b6():
+    print("[B6] 23000 登录已过期 ⇒ 隔离（不是剔除）")
+    tmp = tempfile.mkdtemp()
+    try:
+        acc = pool_state.AccountState(os.path.join(tmp, "f.json"), "accE", 3, 1, 0)
+        ybp.ACCOUNT = acc
+        check("B6 无关文本不误判", ybp._note_expired("20004 用户被封号") is False)
+        check("B6 20004 不算过期", acc.get()["state"] == "enabled", acc.get()["state"])
+        txt = ('创建会话失败: {"error":{"code":"23000","message":"登录已过期，请重新登录"}}')
+        check("B6 23000 命中", ybp._note_expired(txt) is True)
+        st = acc.get()
+        check("B6 过期⇒隔离（不是剔除）", st["state"] == "quarantined",
+              "%s / %s" % (st["state"], st.get("reason")))
+        check("B6 原因可读", "重新登录" in (st.get("reason") or ""), st.get("reason"))
+        # 反向：过期文本不能被 _note_ban 当成封号
+        acc2 = pool_state.AccountState(os.path.join(tmp, "g.json"), "accE2", 3, 1, 0)
+        ybp.ACCOUNT = acc2
+        check("B6 过期不触发剔除", ybp._note_ban(txt) is False)
+        check("B6 账号仍 enabled", acc2.get()["state"] == "enabled", acc2.get()["state"])
+    finally:
+        ybp.ACCOUNT = None
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
-    b1(); b2(); b3(); b4(); b5()
+    b1(); b2(); b3(); b4(); b5(); b6()
     print("\n%s  %d 项失败" % ("❌" if FAILS else "✅ 全部通过", len(FAILS)))
     for f in FAILS:
         print("   -", f)

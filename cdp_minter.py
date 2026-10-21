@@ -614,10 +614,14 @@ class CDPMinter:
             with self._lock:
                 ws = self._ensure_page()
                 return self._eval_on(ws, (
+                    # 🔴 logged_in 只代表"cookie 里还有 hy_user"，**不代表服务端认可**：
+                    #    cookie 残留但已 23000 过期时这里仍是 true（实测踩过）。
+                    #    真正可用性看 logged_out_hint（页面是否明说未登录）/ 保活 last_health。
                     "(() => { const t = document.body.innerText || '';"
                     " return { url: location.href, title: document.title,"
                     "          frozen: t.indexOf('账号已冻结') >= 0,"
                     "          logged_in: document.cookie.indexOf('hy_user') >= 0,"
+                    "          logged_out_hint: t.indexOf('未登录') >= 0,"
                     "          text: t.slice(0, 120) }; })()"
                 ), 20, mid=34) or {}
         except Exception as e:

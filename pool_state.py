@@ -28,7 +28,7 @@ from datetime import datetime
 
 STATES = ("enabled", "disabled", "quarantined", "ejected")
 LABELS = {"enabled": "启用", "disabled": "手动禁用", "quarantined": "自动隔离", "ejected": "已剔除"}
-ACTIONS = ("enable", "disable", "eject", "restore", "reset", "note")
+ACTIONS = ("enable", "disable", "quarantine", "eject", "restore", "reset", "note")
 
 
 class AccountState:
@@ -110,6 +110,10 @@ class AccountState:
                                 "fail_streak": 0, "ok_streak": 0})
             elif action == "disable":
                 self._d.update({"state": "disabled", "reason": reason or "手动禁用"})
+            elif action == "quarantine":
+                # 自动/半自动隔离（例如上游 23000 登录已过期）：
+                # 不去碰 fail_streak —— 语义是"暂时不可用"，重新登录 + 一次保活就能自动恢复
+                self._d.update({"state": "quarantined", "reason": reason or "自动隔离"})
             elif action == "eject":
                 self._d.update({"state": "ejected", "reason": reason or "手动剔除"})
             elif action == "reset":     # 重来一遍：连历史健康结论一起清掉

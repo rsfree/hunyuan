@@ -897,11 +897,11 @@ def _yb_post_json(cookie: str, path: str, body: dict, sig: Optional[dict], agent
     try:
         with _open(req, timeout=timeout) as r:
             _t = r.read().decode("utf-8", "replace")
-            _note_ban(_t)
+            _note_ban(_t) or _note_expired(_t)
             return {"status": r.status, "text": _t}
     except _uerr.HTTPError as e:
         _t = e.read().decode("utf-8", "replace")
-        _note_ban(_t)
+        _note_ban(_t) or _note_expired(_t)
         return {"status": e.code, "text": _t}
 
 
@@ -2018,6 +2018,26 @@ def _cookie_ban_probe(cookie: str, agent_id: str = "naQivTmsDa") -> dict:
     return {"ok": False, "banned": False, "status": 200, "detail": "建会话无 id: " + txt[:100]}
 
 
+def _note_expired(*texts) -> bool:
+    """识别上游「23000 登录已过期」→ 把该号**隔离**（不是剔除：重新登录就能救回来）。
+
+    为什么必须记账：`/api/info/general` 对过期号**仍返回 200**，保活看不出来；
+    若不处理，号池会一直把请求打到死号上，管理员还看到"已登录/可轮询"。
+    """
+    blob = " ".join(str(t) for t in texts if t)
+    if not blob:
+        return False
+    if "23000" not in blob and "登录已过期" not in blob:
+        return False
+    if ACCOUNT is not None:
+        try:
+            ACCOUNT.apply("quarantine", "23000 登录已过期（cookie 残留，需重新登录）", by="auto")
+            print("[expired] 检测到 23000 登录已过期 → 已隔离该号", flush=True)
+        except Exception:
+            pass
+    return True
+
+
 def _yb_auth_error(result: dict):
     """上游 401 → 明确的凭证过期错误（透传模式常见 = hy_token/hy_user 失效，需重新抓 cookie）。"""
     if isinstance(result, dict) and result.get("status") == 401:
@@ -2323,6 +2343,16 @@ async def admin_state(req: Request):
     if (YB_AUTO_WATERMARK and st.get("logged_in") and not st.get("frozen")
             and not _WM_RUNNING and time.time() - _WATERMARK.get("at", 0) > 60):
         asyncio.create_task(_watermark_auto())
+    # 页面明说"未登录"但 cookie 还在（= 23000 过期后的残留）⇒ 立刻纠正，别让号池当成活号
+    if st.get("logged_in") and st.get("logged_out_hint") and ACCOUNT is not None:
+        _lh2 = ACCOUNT.get().get("last_health") or {}
+        if _lh2.get("ok"):
+            try:
+                ACCOUNT.record_health(False, None, "页面显示未登录（cookie 残留，需重新登录）", False,
+                                      count_failure=False)
+                print("[pool_state] 页面显示未登录 → 已置为不可轮询", flush=True)
+            except Exception:
+                pass
     # 页内已显示"账号已冻结" ⇒ 立刻落状态机（隔离）。
     # 不能指望保活来发现：/api/info/general 对冻结号**仍可能返回 200**，
     # 冻结只在创建会话时才报 20004 —— 所以这里以页面事实为准。
@@ -4592,7 +4622,7 @@ async def chat_completions(req: Request):
     except Exception as e:
         import traceback
         traceback.print_exc()
-        _note_ban(e)   # 页内报 "20004 用户被封号" 时立即剔除该号
+        _note_ban(e) or _note_expired(e)   # 20004 封号→剔除；23000 过期→隔离
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
 
     # 用完即删（浏览器模式）：历史零残留
@@ -4917,7 +4947,7 @@ async def images_generations(req: Request):
                         timeout=300,
                     )
     except Exception as e:
-        _note_ban(e)
+        _note_ban(e) or _note_expired(e)
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
 
     # 用完即删（浏览器模式）：历史零残留

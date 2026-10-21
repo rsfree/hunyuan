@@ -352,6 +352,16 @@ YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两�
 # 每凭证**同时在途**请求上限（默认 5）。超过就排队，不会并发打到同一个号上。
 # 与 YB_MIN_INTERVAL 是两道不同的闸：间隔管"发车节奏"，并发数管"同时有几个在路上"。
 YB_ACCT_CONCURRENCY = int(os.environ.get("YB_ACCT_CONCURRENCY", "5"))
+# 生图单独一道更窄的并发闸：人类一次只生成一张，并发 5 张是最明显的脚本特征
+YB_IMAGE_CONCURRENCY = int(os.environ.get("YB_IMAGE_CONCURRENCY", "2"))
+# 活跃时间窗（"7-24"=早 7 点到 24 点；空=不启用）。窗口外只降速不拒绝，见 guard.Window
+YB_ACTIVE_HOURS = os.environ.get("YB_ACTIVE_HOURS", "")
+YB_OFFHOURS_SLOW = float(os.environ.get("YB_OFFHOURS_SLOW", "3"))   # 窗口外间隔倍率
+YB_OFFHOURS_MODE = os.environ.get("YB_OFFHOURS_MODE", "slow")        # slow|block
+YB_FAIL_BACKOFF = float(os.environ.get("YB_FAIL_BACKOFF", "2"))      # 连续失败退避基数（0=关）
+YB_FAIL_BACKOFF_CAP = float(os.environ.get("YB_FAIL_BACKOFF_CAP", "60"))
+YB_IMAGE_COOL = os.environ.get("YB_IMAGE_COOL", "4-10")              # 生图后停顿区间（秒）
+YB_BROWSE_EVERY = int(os.environ.get("YB_BROWSE_EVERY", "0"))        # 每 N 次生图插一次浏览，0=关
 YB_MIN_JITTER = float(os.environ.get("YB_MIN_JITTER", "1.5"))     # 最小间隔之上再叠 0~N 秒随机（越像人越好）
 YB_WARMUP_DAYS = float(os.environ.get("YB_WARMUP_DAYS", "0"))     # 养号期：首次成功后的 N 天内禁生图（0=关闭）
 YB_DAILY_QUOTA = int(os.environ.get("YB_DAILY_QUOTA", "0"))       # 每实例每天最多 N 次生成类调用（0=不限）
@@ -755,6 +765,11 @@ def _account_age_days() -> float:
 
 
 GUARD = _guard.Guard(YB_WARMUP_DAYS, YB_DAILY_QUOTA, _account_age_days)
+# 节律三件套（账号池环境变量可能被 compose 覆盖，这里集中实例化便于 /admin 展示）
+WINDOW = _guard.Window(YB_ACTIVE_HOURS, YB_OFFHOURS_SLOW, YB_OFFHOURS_MODE)
+BACKOFF = _guard.Backoff(YB_FAIL_BACKOFF, YB_FAIL_BACKOFF_CAP)
+_IMG_COOL_UNTIL = {}             # key -> 该凭证最早可再次发车的时刻（生图"看结果"停顿）
+_IMG_DONE_N = {}                 # key -> 本进程内生图成功次数（行为穿插用）
 
 
 def _mctx(**kw):
@@ -1339,7 +1354,7 @@ _ACCT_SEMS = {}                  # key -> Semaphore（按凭证）
 _ACCT_SEMS_LOCK = threading.Lock()
 
 
-def acct_slot(key: str):
+def acct_slot(key: str, kind: str = "chat"):
     """**每凭证并发闸门**：同一凭证同时最多 `YB_ACCT_CONCURRENCY` 个请求在途。
 
     为什么需要第二道闸：`YB_MIN_INTERVAL` 只管"发车节奏"（相邻两个请求隔 2~3.5s），
@@ -1349,23 +1364,73 @@ def acct_slot(key: str):
 
     🔴 Semaphore 按 key 缓存并**跟随配置变化重建**（改 YB_ACCT_CONCURRENCY 后无需重启逻辑）。
     """
-    limit = max(1, YB_ACCT_CONCURRENCY)
+    limit = max(1, YB_IMAGE_CONCURRENCY if kind == "image" else YB_ACCT_CONCURRENCY)
+    skey = (key, kind) if kind == "image" else key
     with _ACCT_SEMS_LOCK:
-        sem = _ACCT_SEMS.get(key)
+        sem = _ACCT_SEMS.get(skey)
         if sem is None or getattr(sem, "_yb_limit", None) != limit:
             sem = threading.Semaphore(limit)
             sem._yb_limit = limit
-            _ACCT_SEMS[key] = sem
+            _ACCT_SEMS[skey] = sem
         return sem
 
 
-def pace(key: str):
+def _cool_range():
+    """YB_IMAGE_COOL="4-10" → (4.0, 10.0)；"0"/空 → (0, 0)。"""
+    s = (YB_IMAGE_COOL or "").strip()
+    if not s or s == "0":
+        return (0.0, 0.0)
+    try:
+        if "-" in s:
+            a, b = s.split("-", 1)
+            return (float(a), float(b))
+        v = float(s)
+        return (v, v)
+    except Exception:
+        return (4.0, 10.0)
+
+
+def _maybe_browse(cookie: str, agent_id: str, pkey: str):
+    """行为穿插：每 N 次生图插一次**只读**请求。
+
+    为什么：一个只会"上传 → 出图 → 上传 → 出图"的账号，行为熵极低。
+    真实用户会翻历史、看设置。这里用 `/api/userinfo/getuserconfig`（页面自己也会调、
+    无副作用、不需要签名里的额外字段），成本几乎为零。
+    """
+    if YB_BROWSE_EVERY <= 0:
+        return
+    n = _IMG_DONE_N.get(pkey, 0) + 1
+    _IMG_DONE_N[pkey] = n
+    if n % YB_BROWSE_EVERY:
+        return
+    try:
+        with _bsk_lock:
+            sig = get_sig(None, False)
+        _yb_post_json(cookie, "/api/userinfo/getuserconfig",
+                      {"scene": 1, "configFields": ["watermarkConfig"]}, sig, agent_id)
+        print("[rhythm] 行为穿插：第 %d 次生图后读一次用户配置" % n, flush=True)
+    except Exception as e:  # noqa: BLE001
+        print("[rhythm] 行为穿插失败（忽略）: %s" % str(e)[:80], flush=True)
+
+
+def pace(key: str, kind: str = "chat"):
     """同凭证限速：最小间隔 YB_MIN_INTERVAL + 0~YB_MIN_JITTER 随机抖动。
 
     为什么加抖动：固定 2s 的等距请求是最容易被识别的脚本特征之一；
     人类操作间隔是长尾分布，加随机后每条连接的时间指纹就不再可疑。
     """
     target = _guard.pace_seconds(YB_MIN_INTERVAL, YB_MIN_JITTER)
+    # ① 非活跃时段整体拖慢（默认 ×3）：凌晨还在稳定出图是最刺眼的信号之一
+    target *= WINDOW.factor()
+    # ② 刚生完图的那一小段"看结果"时间人不该发下一条
+    _cool = _IMG_COOL_UNTIL.get(key, 0)
+    if _cool > time.time():
+        target += _cool - time.time()
+        _IMG_COOL_UNTIL.pop(key, None)
+    # ③ 连续失败时退避（失败后立刻重试会形成固定重试节奏）
+    _bw = BACKOFF.wait(key)
+    if _bw > 0:
+        target += _bw
     # 🔴 必须"预约发车时刻"而不是"睡完再记时间"：
     #    并发下多个线程会同时读到同一个 last、算出同样的 wait，然后同时发车 ⇒ 间隔形同虚设。
     #    这里在锁内一次性把**本次发车时刻**写给下一个请求看，等待放在锁外做（不阻塞别人排队）。
@@ -1858,12 +1923,31 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
     反过来会让排队中的请求白占名额，实际并发数远低于配置值。
     """
     pkey = _acct_key(cookie)          # 账号级分桶（不能用 cookie 前缀，见 _acct_key 注释）
-    pace(pkey)
-    sem = acct_slot(pkey)
+    _kind = "image" if (image_refs or force_image) else "chat"
+    if _kind == "image" and WINDOW.ok and not WINDOW.inside() and WINDOW.mode == "block":
+        return {"error": "当前处于非活跃时段（%d-%d 点），生成请求被主动延后 —— 这是降风控策略，"
+                         "可用 YB_OFFHOURS_MODE=slow 改为仅降速" % (WINDOW.start, WINDOW.end),
+                "status": 503}
+    pace(pkey, _kind)
+    sem = acct_slot(pkey, _kind)
     sem.acquire()
     try:
-        return _cookie_mode_run_inner(cookie, agent_id, prompt, chat_model,
-                                      image_refs, resolution, ratio, force_image)
+        _r = _cookie_mode_run_inner(cookie, agent_id, prompt, chat_model,
+                                    image_refs, resolution, ratio, force_image)
+        _bad = bool((_r or {}).get("error")) or (_r or {}).get("status") in (429, 500, 502, 503)
+        if _bad:
+            BACKOFF.fail(pkey)
+        else:
+            BACKOFF.ok(pkey)
+            if _kind == "image":
+                _lo, _hi = _cool_range()
+                if _hi > 0:
+                    _IMG_COOL_UNTIL[pkey] = time.time() + _guard.image_cool(_lo, _hi)
+                _maybe_browse(cookie, agent_id, pkey)
+        return _r
+    except Exception:
+        BACKOFF.fail(pkey)
+        raise
     finally:
         sem.release()
 
@@ -1958,10 +2042,10 @@ def _cookie_mode_stream(cookie: str, agent_id: str, prompt: str, chat_model: str
     本次创建的会话在结束（含客户端中断触发 GeneratorExit）时统一删除。
     软拒（"服务繁忙"）且**尚无内容产出**时退避重试（重铸签名）。"""
     pkey = _acct_key(cookie)        # 账号级分桶
-    pace(pkey)                      # 先排队（等待不占并发槽）
+    pace(pkey, "chat")              # 先排队（等待不占并发槽）
     if tab is None and YB_MINT_BACKEND != "cdp":
         tab = _ensure_page()["tabId"]
-    sem = acct_slot(pkey)
+    sem = acct_slot(pkey, "chat")
     sem.acquire()
     try:
         for attempt in range(YB_SOFTRETRY + 1):
@@ -2583,6 +2667,18 @@ async def admin_egress(req: Request):
            "proxy": _mask(pool[0] if len(pool) == 1 else (YB_PROXY_POOL or "")),
            "browser_proxy": _mask(YB_BROWSER_PROXY),
            "data_ip": None, "browser_ip": None, "match": None}
+
+    # 节律状态：运维要能一眼看出"现在是否因为时段被降速"
+    try:
+        out["rhythm"] = dict(WINDOW.snapshot(), **BACKOFF.snapshot())
+        out["rhythm"].update({
+            "image_concurrency": YB_IMAGE_CONCURRENCY,
+            "chat_concurrency": YB_ACCT_CONCURRENCY,
+            "min_interval": YB_MIN_INTERVAL, "min_jitter": YB_MIN_JITTER,
+            "image_cool": YB_IMAGE_COOL, "browse_every": YB_BROWSE_EVERY,
+            "image_done": dict(_IMG_DONE_N)})
+    except Exception:
+        pass
 
     # 可选：?account=<组内账号名> —— 用该账号绑定的出口实测（验证"一号一 IP"真的生效）
     _acct = (req.query_params.get("account") or "").strip()

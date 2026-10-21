@@ -119,7 +119,7 @@ def i5():
 
     ybp._yb_post_json = fake_post
     ybp.get_sig = lambda tab=None, force=False: {"uskey": "u", "md5": "m", "ts": "1"}
-    ybp.pace = lambda k: None
+    ybp.pace = lambda k, *a, **kw: None      # 口径变了：pace(key, kind='chat')
     try:
         r = ybp._cookie_mode_run("hy_user=fake; hy_token=fake", "naQivTmsDa", "一只柯基",
                                 "hunyuan_gpt_175B_0404", [], "1K", "1:1", force_image=True)

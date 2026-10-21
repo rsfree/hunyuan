@@ -77,6 +77,25 @@ services:
       YB_WARMUP_DAYS: "${YB_WARMUP_DAYS:-0}"
       # 每实例每天最多 N 次生成类调用（0=不限）。建议 60
       YB_DAILY_QUOTA: "${YB_DAILY_QUOTA:-0}"
+      # === 时间维度的节律（2026-10-22 加，按线上 121 次生图日志复盘）===
+      # 🔴 容器默认是 UTC：不设 TZ 时下面所有"按小时"的策略都按 UTC 算，北京时间会整体错 8 小时。
+      # 用 POSIX 时区串 `CST-8` 而不是 `Asia/Shanghai`：镜像里没装 tzdata，
+      # 写 Asia/Shanghai 会被 glibc 静默忽略并退回 UTC（实测 date 仍显示 UTC，只是时区名变成 "Asia"）
+      TZ: "${TZ:-CST-8}"
+      # 活跃时间窗（本地时区，左闭右开）。窗口外只降速不拒绝（凌晨还在稳定出图最扎眼）
+      YB_ACTIVE_HOURS: "${YB_ACTIVE_HOURS:-7-24}"
+      YB_OFFHOURS_SLOW: "${YB_OFFHOURS_SLOW:-3}"
+      # slow=窗口外只降速；block=窗口外直接拒绝生图
+      YB_OFFHOURS_MODE: "${YB_OFFHOURS_MODE:-slow}"
+      # 生图单独一道更窄的并发闸：人类一次只生成一张，同瞬 5 张是最明显的脚本特征
+      YB_IMAGE_CONCURRENCY: "${YB_IMAGE_CONCURRENCY:-2}"
+      # 生图结束后的"看结果"停顿区间（秒），0=关
+      YB_IMAGE_COOL: "${YB_IMAGE_COOL:-4-10}"
+      # 连续失败的指数退避基数/上限（秒），0=关
+      YB_FAIL_BACKOFF: "${YB_FAIL_BACKOFF:-2}"
+      YB_FAIL_BACKOFF_CAP: "${YB_FAIL_BACKOFF_CAP:-60}"
+      # 每 N 次生图插一次只读浏览请求（行为穿插，0=关）
+      YB_BROWSE_EVERY: "${YB_BROWSE_EVERY:-10}"
     # 实例间互通（号池聚合 / 批量运维 / 跨实例代理）走这个共享网络，用容器名寻址
     networks:
       - yuanbao-net

@@ -161,9 +161,9 @@ def c6():
     j = src.find("def _cookie_mode_run_inner(")
     wrapper = src[i:j]
     check("C6 闸门层不含 _bsk_lock", "_bsk_lock" not in wrapper, "锁又回来了")
-    check("C6 闸门层用 acct_slot", "acct_slot(pkey)" in wrapper)
+    check("C6 闸门层用 acct_slot", "acct_slot(pkey" in wrapper)
     check("C6 先 pace 再抢槽（顺序）",
-          wrapper.find("pace(pkey)") < wrapper.find("sem.acquire()"))
+          wrapper.find("pace(pkey") < wrapper.find("sem.acquire()"))
 
     # inner 里只有 _sig 用锁
     k = src.find("def _cookie_mode_stream(")

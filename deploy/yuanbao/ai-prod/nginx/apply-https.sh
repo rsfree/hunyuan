@@ -2,8 +2,8 @@
 # yuanbao-service · ai-prod 域名入口一键落地（幂等；DNS 未就绪会拒绝执行）
 #
 # 用法（在 ai-prod 上跑，root）：
-#   bash /opt/baidu/apply-https.sh            # 默认 baidu.example.com
-#   HOST=baidu.example.com bash .../apply-https.sh
+#   HOST=yuanbao.example.com bash .../apply-https.sh     # HOST 不传则用下面默认值
+#   HOST=other.example.com   bash .../apply-https.sh     # 给同机另一个服务签发
 #
 # 它做什么：DNS 预检 → acme.sh 签发（HTTP-01 webroot）→ install-cert（含续期 reloadcmd）
 #          → 投 :443 vhost → nginx -t + reload → 打印验证矩阵

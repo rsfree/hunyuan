@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # set-egress.sh — 给每个号钉一个**固定且互不相同**的住宅出口 IP
 #
-# 背景（2026-10-21 对 pool.example.com 实测）：
+# 背景（对代理池的 SOCKS5 端口实测，端口语义如下）：
 #   2086  http    每请求换出口
 #   2088  socks5h 每请求换出口            ← 我们原来用的，同一 cookie 一分钟跨 N 个 IP
 #   2089  socks5h 按目标域名哈希（同域名恒定，但**所有号共用一个** ⇒ 多号同 IP）

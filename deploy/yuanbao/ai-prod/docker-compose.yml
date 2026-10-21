@@ -71,6 +71,8 @@ services:
       # 同凭证两请求最小间隔 + 0~N 秒随机抖动（固定等距最像脚本）
       YB_MIN_INTERVAL: "${YB_MIN_INTERVAL:-2}"
       YB_MIN_JITTER: "${YB_MIN_JITTER:-1.5}"
+      # 每凭证同时在途请求上限（间隔管发车节奏，这个管"同时几个在路上"）
+      YB_ACCT_CONCURRENCY: "${YB_ACCT_CONCURRENCY:-5}"
       # 养号期：本实例首次保活成功后的 N 天内**禁止生图**（0=关闭）。建议 3
       YB_WARMUP_DAYS: "${YB_WARMUP_DAYS:-0}"
       # 每实例每天最多 N 次生成类调用（0=不限）。建议 60

@@ -284,6 +284,9 @@ YB_DATA_PLANE = os.environ.get("YB_DATA_PLANE", "auto")  # auto|page|cookie：au
 YB_MINTER_URL = os.environ.get("YB_MINTER_URL", "")   # 远程 minter 服务（YB_MINT_BACKEND=http 时用）
 YB_MINTER_TOKEN = os.environ.get("YB_MINTER_TOKEN", "")  # minter 服务鉴权（X-Minter-Key）
 YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
+# 每凭证**同时在途**请求上限（默认 5）。超过就排队，不会并发打到同一个号上。
+# 与 YB_MIN_INTERVAL 是两道不同的闸：间隔管"发车节奏"，并发数管"同时有几个在路上"。
+YB_ACCT_CONCURRENCY = int(os.environ.get("YB_ACCT_CONCURRENCY", "5"))
 YB_MIN_JITTER = float(os.environ.get("YB_MIN_JITTER", "1.5"))     # 最小间隔之上再叠 0~N 秒随机（越像人越好）
 YB_WARMUP_DAYS = float(os.environ.get("YB_WARMUP_DAYS", "0"))     # 养号期：首次成功后的 N 天内禁生图（0=关闭）
 YB_DAILY_QUOTA = int(os.environ.get("YB_DAILY_QUOTA", "0"))       # 每实例每天最多 N 次生成类调用（0=不限）
@@ -1244,6 +1247,31 @@ def get_sig(tab: str, force: bool = False) -> dict:
     return sig
 
 
+_last_lock = threading.Lock()    # 保护 _last_req_at（预约发车时刻）
+_ACCT_SEMS = {}                  # key -> Semaphore（按凭证）
+_ACCT_SEMS_LOCK = threading.Lock()
+
+
+def acct_slot(key: str):
+    """**每凭证并发闸门**：同一凭证同时最多 `YB_ACCT_CONCURRENCY` 个请求在途。
+
+    为什么需要第二道闸：`YB_MIN_INTERVAL` 只管"发车节奏"（相邻两个请求隔 2~3.5s），
+    管不住"已经在路上的有多少个"。生图单次 30~60s，间隔到点就发车会让同一个号
+    同时挂 5~10 个未完成请求 —— 这个特征比固定间隔更像脚本。
+    ⇒ 间隔 + 并发数两道闸配合：既像人，又不会把自己压垮。
+
+    🔴 Semaphore 按 key 缓存并**跟随配置变化重建**（改 YB_ACCT_CONCURRENCY 后无需重启逻辑）。
+    """
+    limit = max(1, YB_ACCT_CONCURRENCY)
+    with _ACCT_SEMS_LOCK:
+        sem = _ACCT_SEMS.get(key)
+        if sem is None or getattr(sem, "_yb_limit", None) != limit:
+            sem = threading.Semaphore(limit)
+            sem._yb_limit = limit
+            _ACCT_SEMS[key] = sem
+        return sem
+
+
 def pace(key: str):
     """同凭证限速：最小间隔 YB_MIN_INTERVAL + 0~YB_MIN_JITTER 随机抖动。
 
@@ -1251,11 +1279,16 @@ def pace(key: str):
     人类操作间隔是长尾分布，加随机后每条连接的时间指纹就不再可疑。
     """
     target = _guard.pace_seconds(YB_MIN_INTERVAL, YB_MIN_JITTER)
-    last = _last_req_at.get(key, 0)
-    wait = target - (time.time() - last)
+    # 🔴 必须"预约发车时刻"而不是"睡完再记时间"：
+    #    并发下多个线程会同时读到同一个 last、算出同样的 wait，然后同时发车 ⇒ 间隔形同虚设。
+    #    这里在锁内一次性把**本次发车时刻**写给下一个请求看，等待放在锁外做（不阻塞别人排队）。
+    with _last_lock:
+        now = time.time()
+        last = _last_req_at.get(key, 0)
+        wait = target - (now - last)
+        _last_req_at[key] = now + wait if wait > 0 else now
     if wait > 0:
         time.sleep(wait)
-    _last_req_at[key] = time.time()
 
 
 def is_softreject(result: dict) -> bool:
@@ -1732,69 +1765,98 @@ def _mint_only(tab: str) -> dict:
 def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
                      image_refs: list, resolution: str, ratio: Optional[str] = None,
                      force_image: bool = False) -> dict:
-    """凭证透传模式：数据面全走代理出站 HTTP（签名仍借页面铸造）。
-    返回与浏览器路径同构的 result dict。含限速 + 软拒退避重试。
-    force_image=True 时（chat 门生图模型）无参考图也走文生图管道。"""
-    # cdp 模式无 bsk 页面：agent 取常量；bsk 模式才需 _ensure_page
-    ctx = _ensure_page() if YB_MINT_BACKEND != "cdp" else {"tabId": None, "agentId": "naQivTmsDa"}
-    pace("ck:" + cookie[:16])
-    with _bsk_lock:
-        created_convs = []  # 本次运行创建的会话（结束后统一删除）
-        def run_once(sig):
-            if YUANBAO_CONVERSATION:
-                conv = YUANBAO_CONVERSATION
-            elif YB_CREATE_CONV == "1":
-                r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
-                                  {"agentId": agent_id}, sig, agent_id)
-                if r["status"] == 401:
-                    return {"status": 401, "text": r["text"]}
-                conv = json.loads(r["text"]).get("id")
-                if not conv:
-                    raise RuntimeError("创建会话失败: " + r["text"][:150])
-                created_convs.append(conv)
-            else:
-                # 可选捷径（YB_CREATE_CONV=0）：默认关闭
-                conv = str(uuid.uuid4())
-                created_convs.append(conv)
-            if image_refs or force_image:
-                multimedia = []
-                for i, ref in enumerate(image_refs[:4]):
-                    uri = _ref_to_data_uri(ref)
-                    head, _, b64data = uri.partition(";base64,")
-                    mime = head[5:].split(";")[0] or "image/png"
-                    if not mime.startswith("image/"):
-                        mime = "image/png"
-                    ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
-                    multimedia.append(_yb_upload_ref(cookie, agent_id, b64data, f"ref_{i}.{ext}", mime))
-                body = _yb_image_body(conv, agent_id, prompt, multimedia, resolution, chat_model, ratio)
-                r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv,
-                                  extra={"X-Event-Input-Type": "15"})
-                parsed = _parse_yb_sse_common(r["text"])
-                return {"status": r["status"], "urls": parsed["urls"], "wmUrls": parsed["wmUrls"],
-                        "text": parsed["text"], "error": parsed["error"],
-                        "raw": None if parsed["urls"] else r["text"][:400]}
-            body = _yb_chat_body(conv, agent_id, prompt, chat_model)
-            r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv)
-            return {"status": r["status"], "text": r["text"]}
+    """凭证透传模式的**闸门层**：限速 → 每凭证并发闸门 → 交给 _cookie_mode_run_inner。
 
-        sig = get_sig(ctx["tabId"])
+    两道闸的顺序很关键：先 `pace()` 排队（等待不占并发槽），再抢并发槽；
+    反过来会让排队中的请求白占名额，实际并发数远低于配置值。
+    """
+    pkey = "ck:" + cookie[:16]
+    pace(pkey)
+    sem = acct_slot(pkey)
+    sem.acquire()
+    try:
+        return _cookie_mode_run_inner(cookie, agent_id, prompt, chat_model,
+                                      image_refs, resolution, ratio, force_image)
+    finally:
+        sem.release()
+
+
+def _cookie_mode_run_inner(cookie: str, agent_id: str, prompt: str, chat_model: str,
+                           image_refs: list, resolution: str, ratio: Optional[str] = None,
+                           force_image: bool = False) -> dict:
+    """凭证透传模式：数据面全走代理出站 HTTP（签名仍借页面铸造）。
+    返回与浏览器路径同构的 result dict。含软拒退避重试。
+    force_image=True 时（chat 门生图模型）无参考图也走文生图管道。
+
+    ⚠️ 本函数**不再持有全局锁**（铸签除外），可被多线程并发调用。
+    """
+    ctx = _ensure_page() if YB_MINT_BACKEND != "cdp" else {"tabId": None, "agentId": "naQivTmsDa"}
+    created_convs = []  # 本次运行创建的会话（结束后统一删除）
+    def run_once(sig):
+        if YUANBAO_CONVERSATION:
+            conv = YUANBAO_CONVERSATION
+        elif YB_CREATE_CONV == "1":
+            r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
+                              {"agentId": agent_id}, sig, agent_id)
+            if r["status"] == 401:
+                return {"status": 401, "text": r["text"]}
+            conv = json.loads(r["text"]).get("id")
+            if not conv:
+                raise RuntimeError("创建会话失败: " + r["text"][:150])
+            created_convs.append(conv)
+        else:
+            # 可选捷径（YB_CREATE_CONV=0）：默认关闭
+            conv = str(uuid.uuid4())
+            created_convs.append(conv)
+        if image_refs or force_image:
+            multimedia = []
+            for i, ref in enumerate(image_refs[:4]):
+                uri = _ref_to_data_uri(ref)
+                head, _, b64data = uri.partition(";base64,")
+                mime = head[5:].split(";")[0] or "image/png"
+                if not mime.startswith("image/"):
+                    mime = "image/png"
+                ext = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/gif": "gif"}.get(mime, "png")
+                multimedia.append(_yb_upload_ref(cookie, agent_id, b64data, f"ref_{i}.{ext}", mime))
+            body = _yb_image_body(conv, agent_id, prompt, multimedia, resolution, chat_model, ratio)
+            r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv,
+                              extra={"X-Event-Input-Type": "15"})
+            parsed = _parse_yb_sse_common(r["text"])
+            return {"status": r["status"], "urls": parsed["urls"], "wmUrls": parsed["wmUrls"],
+                    "text": parsed["text"], "error": parsed["error"],
+                    "raw": None if parsed["urls"] else r["text"][:400]}
+        body = _yb_chat_body(conv, agent_id, prompt, chat_model)
+        r = _yb_post_json(cookie, f"/api/chat/{conv}", body, sig, agent_id, conv)
+        return {"status": r["status"], "text": r["text"]}
+
+    def _sig(force: bool = False) -> dict:
+        """铸签**必须串行**（CDP 单页），所以只在这一步拿全局锁。
+
+        🔴 这是并发优化的核心：原来整个请求（建会话 + 上传参考图 + 发请求 + 收响应）
+           都包在 `_bsk_lock` 里 ⇒ 一个实例同时只能跑一个请求，吞吐 = 1/处理时间。
+           签名只绑设备、拿到后可复用（YB_SIG_TTL 内），请求本体是纯 HTTP，可以并行。
+        """
+        with _bsk_lock:
+            return get_sig(ctx["tabId"], force=force)
+
+    sig = _sig()
+    result = run_once(sig)
+    # 软拒退避：强制重铸签名重试
+    attempt = 0
+    while is_softreject(result) and attempt < YB_SOFTRETRY and result.get("status") == 200:
+        attempt += 1
+        time.sleep(2.0 * attempt)
+        sig = _sig(force=True)
         result = run_once(sig)
-        # 软拒退避：强制重铸签名重试
-        attempt = 0
-        while is_softreject(result) and attempt < YB_SOFTRETRY and result.get("status") == 200:
-            attempt += 1
-            time.sleep(2.0 * attempt)
-            sig = get_sig(ctx["tabId"], force=True)
-            result = run_once(sig)
-        # 用完即删：本次创建的会话全部清理（含软拒重试产生的），历史零残留
-        if YB_DELETE_CONV == "1":
-            for cv in created_convs:
-                try:
-                    _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
-                                  {"cid": cv}, sig, agent_id, timeout=30)
-                except Exception:
-                    pass
-        return result
+    # 用完即删：本次创建的会话全部清理（含软拒重试产生的），历史零残留
+    if YB_DELETE_CONV == "1":
+        for cv in created_convs:
+            try:
+                _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
+                              {"cid": cv}, sig, agent_id, timeout=30)
+            except Exception:
+                pass
+    return result
 
 
 def _cookie_mode_stream(cookie: str, agent_id: str, prompt: str, chat_model: str,
@@ -1808,98 +1870,103 @@ def _cookie_mode_stream(cookie: str, agent_id: str, prompt: str, chat_model: str
       {"finish": "stop"}                                # 正常结束
     本次创建的会话在结束（含客户端中断触发 GeneratorExit）时统一删除。
     软拒（"服务繁忙"）且**尚无内容产出**时退避重试（重铸签名）。"""
-    pace("ck:" + cookie[:16])
+    pkey = "ck:" + cookie[:16]
+    pace(pkey)                      # 先排队（等待不占并发槽）
     if tab is None and YB_MINT_BACKEND != "cdp":
         tab = _ensure_page()["tabId"]
-    for attempt in range(YB_SOFTRETRY + 1):
-        with _bsk_lock:
-            sig = get_sig(tab, force=attempt > 0)
-        conv, created = None, False
-        if YUANBAO_CONVERSATION:
-            conv = YUANBAO_CONVERSATION
-        elif YB_CREATE_CONV == "1":
-            r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
-                              {"agentId": agent_id}, sig, agent_id)
-            if r["status"] != 200:
-                yield {"error": ("元宝凭证失效（HTTP 401）" if r["status"] == 401
-                                 else "创建会话失败 HTTP %d" % r["status"]),
-                       "status": r["status"]}
-                return
-            try:
-                conv = json.loads(r["text"]).get("id")
-            except Exception:
-                conv = None
-            if not conv:
-                yield {"error": "创建会话失败: " + r["text"][:150]}
-                return
-            created = True
-        else:
-            conv = str(uuid.uuid4())
-            created = True
-
-        emitted, err, status, retryable = False, None, 200, False
-        body = _yb_chat_body(conv, agent_id, prompt, chat_model)
-        try:
-            resp = _yb_stream_open(cookie, "/api/chat/%s" % conv, body, sig, agent_id, conv, timeout=timeout)
-        except Exception as e:
-            resp, err, status, retryable = None, ("上游连接失败: %s" % (str(e)[:160])), 502, True
-        if resp is not None:
-            status = resp.status or 0
-            if status != 200:
+    sem = acct_slot(pkey)
+    sem.acquire()
+    try:
+        for attempt in range(YB_SOFTRETRY + 1):
+            with _bsk_lock:
+                sig = get_sig(tab, force=attempt > 0)
+            conv, created = None, False
+            if YUANBAO_CONVERSATION:
+                conv = YUANBAO_CONVERSATION
+            elif YB_CREATE_CONV == "1":
+                r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
+                                  {"agentId": agent_id}, sig, agent_id)
+                if r["status"] != 200:
+                    yield {"error": ("元宝凭证失效（HTTP 401）" if r["status"] == 401
+                                     else "创建会话失败 HTTP %d" % r["status"]),
+                           "status": r["status"]}
+                    return
                 try:
-                    detail = resp.read().decode("utf-8", "replace")[:200]
+                    conv = json.loads(r["text"]).get("id")
                 except Exception:
-                    detail = ""
-                finally:
-                    resp.close()
-                err = ("元宝凭证失效（HTTP 401）" if status == 401
-                       else "元宝 HTTP %d %s" % (status, detail))
-                # 🔴 只对 5xx / 429 重试；401/403/400 是确定性失败，重试纯属白等（实测 +2s 退避）
-                retryable = status >= 500 or status == 429
+                    conv = None
+                if not conv:
+                    yield {"error": "创建会话失败: " + r["text"][:150]}
+                    return
+                created = True
             else:
-                try:
-                    for line in resp.iter_lines():
-                        ev = _yb_line_event(line)
-                        if not ev:
-                            continue
-                        kind = ev["kind"]
-                        if kind == "text":
-                            emitted = True
-                            yield {"delta": {"content": ev["msg"]}}
-                        elif kind == "think":
-                            yield {"delta": {"reasoning_content": ev["msg"]}}
-                        elif kind == "meta":
-                            if ev.get("usage"):
-                                yield {"usage": ev["usage"]}
-                            if ev.get("error"):
-                                err = ev["error"]
-                        elif kind == "error":
-                            err = ev["msg"]
-                            # 封号是确定性失败，重试没意义（_note_ban 同时会剔除该号）
-                            retryable = not _note_ban(ev["msg"])
-                except GeneratorExit:
-                    raise
-                except Exception as e:
-                    err = err or ("上游流中断: %s" % (str(e)[:160]))
-                    retryable = retryable or not emitted   # 已有正文就不再重试
-                finally:
-                    resp.close()
-        if created and YB_DELETE_CONV == "1":
+                conv = str(uuid.uuid4())
+                created = True
+
+            emitted, err, status, retryable = False, None, 200, False
+            body = _yb_chat_body(conv, agent_id, prompt, chat_model)
             try:
-                _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
-                              {"cid": conv}, sig, agent_id, timeout=30)
-            except Exception:
-                pass
+                resp = _yb_stream_open(cookie, "/api/chat/%s" % conv, body, sig, agent_id, conv, timeout=timeout)
+            except Exception as e:
+                resp, err, status, retryable = None, ("上游连接失败: %s" % (str(e)[:160])), 502, True
+            if resp is not None:
+                status = resp.status or 0
+                if status != 200:
+                    try:
+                        detail = resp.read().decode("utf-8", "replace")[:200]
+                    except Exception:
+                        detail = ""
+                    finally:
+                        resp.close()
+                    err = ("元宝凭证失效（HTTP 401）" if status == 401
+                           else "元宝 HTTP %d %s" % (status, detail))
+                    # 🔴 只对 5xx / 429 重试；401/403/400 是确定性失败，重试纯属白等（实测 +2s 退避）
+                    retryable = status >= 500 or status == 429
+                else:
+                    try:
+                        for line in resp.iter_lines():
+                            ev = _yb_line_event(line)
+                            if not ev:
+                                continue
+                            kind = ev["kind"]
+                            if kind == "text":
+                                emitted = True
+                                yield {"delta": {"content": ev["msg"]}}
+                            elif kind == "think":
+                                yield {"delta": {"reasoning_content": ev["msg"]}}
+                            elif kind == "meta":
+                                if ev.get("usage"):
+                                    yield {"usage": ev["usage"]}
+                                if ev.get("error"):
+                                    err = ev["error"]
+                            elif kind == "error":
+                                err = ev["msg"]
+                                # 封号是确定性失败，重试没意义（_note_ban 同时会剔除该号）
+                                retryable = not _note_ban(ev["msg"])
+                    except GeneratorExit:
+                        raise
+                    except Exception as e:
+                        err = err or ("上游流中断: %s" % (str(e)[:160]))
+                        retryable = retryable or not emitted   # 已有正文就不再重试
+                    finally:
+                        resp.close()
+            if created and YB_DELETE_CONV == "1":
+                try:
+                    _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
+                                  {"cid": conv}, sig, agent_id, timeout=30)
+                except Exception:
+                    pass
 
-        if err and retryable and not emitted and attempt < YB_SOFTRETRY:
-            time.sleep(2.0 * (attempt + 1))
-            continue
-        if err:
-            yield {"error": err, "status": status}
-        else:
-            yield {"finish": "stop"}
-        return
-
+            if err and retryable and not emitted and attempt < YB_SOFTRETRY:
+                time.sleep(2.0 * (attempt + 1))
+                continue
+            if err:
+                yield {"error": err, "status": status}
+            else:
+                yield {"finish": "stop"}
+            return
+    finally:
+        sem.release()
 
 def _live_chat_sse(mctx, cookie: str, agent_id: str, prompt: str, chat_model: str,
                    tab, comp_id: str, created: int, model_in: str):
@@ -4847,11 +4914,15 @@ async def chat_completions(req: Request):
     try:
         if cookie_str:
             # ---- 凭证透传模式：客户端 cookie + 页内铸签名，数据面走出站 HTTP ----
-            result = _cookie_mode_run(cookie_str, (("naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"])), prompt,
-                                      chat_model, image_refs,
-                                      _size_to_resolution(body.get("size", "")),
-                                      _size_to_ratio(body.get("size", "")),
-                                      force_image=_is_image_model(model_in))
+            # 🔴 必须丢到线程池：`_cookie_mode_run` 是同步阻塞的（pace 睡眠 + 出站 HTTP）。
+            #    直接在 async 函数里调用会**卡住整个事件循环** ⇒ 加了并发闸门也毫无并行可言。
+            _agent = "naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"]
+            result = await asyncio.to_thread(
+                _cookie_mode_run, cookie_str, _agent, prompt,
+                chat_model, image_refs,
+                _size_to_resolution(body.get("size", "")),
+                _size_to_ratio(body.get("size", "")),
+                _is_image_model(model_in))
 
         else:
             # 浏览器模式：执行器 = bsk（本机）| cdp（服务器 headless Chromium）
@@ -5342,10 +5413,13 @@ async def _images_core(req: Request, body: dict, image_refs_in=None):
             #    `if image_refs or force_image:` 才走生图管道，否则退化成**纯文本聊天**
             #    ⇒ 文生图（无参考图）会拿到一段文字，然后报「未获取到图片: None」。
             #    chat 门早就传了，images 端点一直漏传，属长期隐性 bug。
-            result = _cookie_mode_run(cookie_str, (("naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"])), prompt,
-                                      chat_model, image_refs, resolution,
-                                      _size_to_ratio(body.get("size", "")),
-                                      force_image=not image_refs)
+            # 🔴 同 chat 门：同步阻塞函数必须丢线程池，否则事件循环被卡死、并发闸门形同虚设
+            _agent = "naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"]
+            result = await asyncio.to_thread(
+                _cookie_mode_run, cookie_str, _agent, prompt,
+                chat_model, image_refs, resolution,
+                _size_to_ratio(body.get("size", "")),
+                not image_refs)
 
         else:
             # 浏览器模式：执行器 = bsk（本机）| cdp（服务器 headless Chromium）

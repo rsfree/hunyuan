@@ -103,6 +103,27 @@ class CookieAccounts:
                         "routable": bool(st.get("routable")) and (st.get("last_health") or {}).get("ok") is True})
         return out
 
+    @staticmethod
+    def hy_user_of(cookie: str) -> str:
+        """从 cookie 串里取 hy_user（账号唯一标识）。取不到返回空串。"""
+        m = re.search(r"(?:^|;\s*)hy_user=([^;]+)", cookie or "")
+        return (m.group(1).strip() if m else "")
+
+    def find_by_user(self, hy_user: str):
+        """按 hy_user 找已有账号名 —— 同一号换了 cookie 时用它做"替换"而不是"新增"。"""
+        if not hy_user:
+            return None
+        try:
+            names = [x[:-5] for x in os.listdir(self.dir)
+                     if x.endswith(".json") and not x.endswith(".state.json")]
+        except Exception:
+            return None
+        for nm in names:
+            d = self.get(nm)
+            if d and self.hy_user_of(d.get("cookie")) == hy_user:
+                return nm
+        return None
+
     def get(self, name: str):
         if not NAME_RE.match(name or ""):
             return None

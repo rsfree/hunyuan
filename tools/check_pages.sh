@@ -12,7 +12,7 @@ import re, subprocess, sys, tempfile, os
 node = sys.argv[1]
 src = open('yuanbao_openai_proxy.py', encoding='utf-8').read()
 bad = 0
-for n in ['MANAGE_HTML', 'STATS_HTML', 'QR_HTML', 'ADMIN_HTML', 'NAV_HTML']:
+for n in ['MANAGE_HTML', 'STATS_HTML', 'QR_HTML', 'ADMIN_HTML', 'NAV_HTML', 'BULK_HTML']:
     a = src.index(n + ' = """'); b = src.index('"""', a + len(n) + 6)
     html = src[a + len(n) + 6:b]
     html = html.encode('utf-8').decode('unicode_escape').encode('latin-1', 'ignore').decode('utf-8', 'ignore')

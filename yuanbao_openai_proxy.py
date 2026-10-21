@@ -37,6 +37,7 @@ import time
 import uuid
 import subprocess
 import threading
+import contextvars
 from typing import Optional
 
 import accounts as _acc
@@ -96,6 +97,52 @@ YB_PROXY_POOL = os.environ.get("YB_PROXY_POOL", "")   # 代理池（逗号分隔
 YB_BROWSER_PROXY = os.environ.get("YB_BROWSER_PROXY", "")
 _PROXY_BAD: dict = {}          # 代理 -> 冷却截止（失败后 60s 内跳过）
 _PROXY_IDX = 0
+
+
+# ---------------------------------------------------------------- 账号级出口
+# 默认空=不启用（沿用实例级 YB_PROXY_URL）。非空时按账号分出口，见 accounts.py 的 egress。
+YB_EGRESS_USER_PREFIX = os.environ.get("YB_EGRESS_USER_PREFIX", "")   # 默认从 YB_PROXY_URL 推断
+_CUR_EGRESS = contextvars.ContextVar("yb_cur_egress", default="")
+
+
+def _egress_url(slot: str) -> str:
+    """会话槽 → 代理 URL。`slot` 形如 acct03，拼成 `socks5h://poolclient-acct03:pw@host:port`。
+
+    会话键只换**用户名裸后缀**（实测 `poolclient-session-xxx` 会被 SOCKS5 鉴权拒）。
+    不是 socks5 形态或拿不到密码时返回空 ⇒ 调用方退回实例默认出口。
+    """
+    u = (YB_PROXY_URL or "").strip()
+    if not u or not slot:
+        return ""
+    m = re.match(r"^(socks5h?)://([^:@/]+):([^@]*)@(.+)$", u)
+    if not m:
+        return ""
+    scheme, user, pw, hostport = m.group(1), m.group(2), m.group(3), m.group(4)
+    prefix = YB_EGRESS_USER_PREFIX or (user.split("-", 1)[0] + "-" if "-" in user else "")
+    if not prefix:
+        return ""
+    return "%s://%s%s:%s@%s" % (scheme, prefix, slot, pw, hostport)
+
+
+def _egress_of_cookie(cookie: str) -> str:
+    """cookie 串 → 该账号绑定的会话槽（没绑定/查不到返回空）。"""
+    if not cookie or COOKIE_ACCOUNTS is None:
+        return ""
+    try:
+        hu = _acc.CookieAccounts.hy_user_of(cookie)
+        if not hu:
+            return ""
+        return ((COOKIE_ACCOUNTS.by_user_map().get(hu) or {}).get("egress") or "").strip()
+    except Exception:
+        return ""
+
+
+def _set_egress_from_cookie(cookie: str):
+    """把当前请求的出口写进 contextvar —— `_open` 零侵入地跟着账号走。"""
+    try:
+        _CUR_EGRESS.set(_egress_of_cookie(cookie) or "")
+    except Exception:
+        pass
 
 
 def _proxy_list():
@@ -162,6 +209,17 @@ def _open(req, timeout: int = 300):
     socks5h 走 requests；http/https 代理与直连走 urllib。
     仅"连不上"类错误才标记代理故障并换下一个/直连兜底；HTTP 4xx/5xx 属正常响应（代理是通的），直接返回。"""
     order = []
+    _cur = _CUR_EGRESS.get()
+    if _cur:
+        pr_one = _egress_url(_cur)
+        if pr_one:
+            # 🔴 账号级出口**不做故障转移**：换出口＝换身份，比这次失败更糟。
+            fresh = _ureq.Request(req.full_url, data=getattr(req, "data", None),
+                                  headers=dict(req.headers), method=req.get_method())
+            if pr_one.split("://", 1)[0].lower().startswith("socks"):
+                return _open_socks(fresh, pr_one, timeout)
+            handler = _ureq.ProxyHandler({"http": pr_one, "https": pr_one})
+            return _ureq.build_opener(handler).open(fresh, timeout=timeout)
     pool = _proxy_list()
     n = len(pool) or 1
     for _ in range(n + 1):          # 池内每个代理各试一次 + 直连兜底
@@ -255,6 +313,13 @@ def _open_stream(req, timeout: int = 300):
     """流式出站（不预读 body）。与 _open 同款代理池轮换；
     仅在"连不上"时换下一个/直连兜底，HTTP 4xx/5xx 原样返回（body 仍可流式读）。"""
     order = []
+    _cur = _CUR_EGRESS.get()
+    if _cur:
+        pr_one = _egress_url(_cur)
+        if pr_one:
+            fresh = _ureq.Request(req.full_url, data=getattr(req, "data", None),
+                                  headers=dict(req.headers), method=req.get_method())
+            return _open_socks_stream(fresh, pr_one, timeout)
     pool = _proxy_list()
     n = len(pool) or 1
     for _ in range(n + 1):
@@ -375,6 +440,7 @@ def _check_auth(request: Request):
     另支持 X-Yuanbao-Cookie 头直接放 cookie 串（优先级高于 Bearer 的 cookie 判定）。"""
     yb_cookie = request.headers.get("x-yuanbao-cookie", "").strip()
     if yb_cookie:
+        _set_egress_from_cookie(yb_cookie)
         return ("cookie", yb_cookie)
     value = _bearer_value(request)
     if not value:
@@ -382,6 +448,7 @@ def _check_auth(request: Request):
         # 免去 fetch+blob（内嵌预览面板/沙箱 iframe 里 blob: 常被拦，导致裂图）
         value = (request.query_params.get("k") or request.query_params.get("key") or "").strip()
     if value and _looks_like_cookie(value):
+        _set_egress_from_cookie(value)
         return ("cookie", value)
     if YUANBAO_API_KEY:
         if value == YUANBAO_API_KEY:
@@ -2517,12 +2584,27 @@ async def admin_egress(req: Request):
            "browser_proxy": _mask(YB_BROWSER_PROXY),
            "data_ip": None, "browser_ip": None, "match": None}
 
+    # 可选：?account=<组内账号名> —— 用该账号绑定的出口实测（验证"一号一 IP"真的生效）
+    _acct = (req.query_params.get("account") or "").strip()
+    _tok = None
+    if _acct:
+        _slot = ""
+        if COOKIE_ACCOUNTS is not None:
+            _slot = ((COOKIE_ACCOUNTS.get(_acct) or {}).get("egress") or "").strip()
+        out.update({"account": _acct, "account_egress": _slot,
+                    "account_proxy": _mask(_egress_url(_slot)) if _slot else "",
+                    "account_mode": ("账号级出口" if _slot else "实例默认出口")})
+        if _slot:
+            _tok = _CUR_EGRESS.set(_slot)
     try:
         rq = _ureq.Request("https://api.ipify.org")
         with _open(rq, timeout=25) as r:
             out["data_ip"] = r.read().decode("utf-8", "replace").strip()
     except Exception as e:
         out["data_ip"] = "ERR: %s" % str(e)[:120]
+    finally:
+        if _tok is not None:
+            _CUR_EGRESS.reset(_tok)
 
     if YB_MINT_BACKEND == "cdp":
         try:
@@ -3125,8 +3207,14 @@ async def admin_group(req: Request):
         return cred
     if COOKIE_ACCOUNTS is None:
         return JSONResponse({"error": "账号库未启用（YB_ACCOUNTS_DIR 不可写）"}, status_code=503)
-    return {"instance": YB_INSTANCE_NAME_ENV, "accounts": COOKIE_ACCOUNTS.list(),
-            "note": "组内账号共用本实例浏览器的设备指纹；跨组隔离靠部署多个实例"}
+    _accs = COOKIE_ACCOUNTS.list()
+    for _it in _accs:                      # 让页面/脚本能直接看到"这个号从哪个 IP 出去"
+        _it["egress_url_ok"] = bool(_egress_url(_it.get("egress") or ""))
+    return {"instance": YB_INSTANCE_NAME_ENV, "accounts": _accs,
+            "egress_slots": COOKIE_ACCOUNTS.EGRESS_SLOTS,
+            "egress_mode": "按账号分出口" if YB_EGRESS_USER_PREFIX or _egress_url(
+                COOKIE_ACCOUNTS.EGRESS_PREFIX + "01") else "实例默认出口",
+            "note": "组内账号共用本实例浏览器的设备指纹；出口 IP 可按账号绑定（egress 字段）"}
 
 
 def _clean_cookie(s: str) -> str:
@@ -3271,6 +3359,17 @@ async def admin_group_op(req: Request):
     action = (body.get("action") or "").strip()
     name = (body.get("name") or "").strip()
     note = (body.get("note") or "").strip()
+
+    if action == "egress":
+        # 改绑出口槽：egress="" 表示改回实例默认出口；"auto" 表示重新均匀分配
+        slot = (body.get("egress") or "").strip()
+        if slot == "auto":
+            slot = COOKIE_ACCOUNTS._pick_egress()
+        r = COOKIE_ACCOUNTS.set_egress(name, slot)
+        if not r.get("ok"):
+            return JSONResponse({"error": r.get("error")}, status_code=400)
+        r["url_ok"] = bool(_egress_url(r.get("egress") or ""))
+        return r
 
     if action == "capture":
         import cdp_minter

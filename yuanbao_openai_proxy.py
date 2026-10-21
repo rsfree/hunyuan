@@ -4978,6 +4978,8 @@ async def images_generations(req: Request):
         data.append(item)
     if n < len(data):
         data = data[:n]
+    # 上游 image_gen_param 里没有"数量"字段 ⇒ 一次只出 1 张（除非它自己回多变体）。
+    # `n` 只做上限截断（data[:n]），不循环请求凑数量 —— 那是拿封号风险换数量。
     payload = {"created": created, "data": data}
     if _up:
         payload["upscale"] = _up

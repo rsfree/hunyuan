@@ -23,7 +23,7 @@ import time
 import urllib.request
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:39177/pool"
-KEY = sys.argv[2] if len(sys.argv) > 2 else ""
+KEY = sys.argv[2] if len(sys.argv) > 2 else os.environ.get("YBKEY", "")
 URL_REF = os.environ.get("URL_REF", "")
 
 PROMPT = "把这张图的背景换成雪山日落，主体保持完全不变，光影自然，高清细节"

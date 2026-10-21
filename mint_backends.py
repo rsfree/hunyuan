@@ -86,6 +86,11 @@ class CdpMinter(MinterBase):
         h = {}
         if fp.get("h38"):
             h["X-HY92"] = fp["h38"]          # uskey 与 h38 必须同源
+        if fp.get("u42"):
+            # 🔴 实测：真实请求里 X-device-id == X-HY93 == _qimei_uuid42（同一串）
+            # 原来 STATIC_HEADERS 写死一个常量 ⇒ 所有号共用同一 device-id（强关联信号）
+            h["X-HY93"] = fp["u42"]
+            h["X-device-id"] = fp["u42"]
         if fp.get("ver"):
             h["X-WebVersion"] = fp["ver"]
         if fp.get("tag"):

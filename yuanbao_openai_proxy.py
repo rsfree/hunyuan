@@ -80,6 +80,9 @@ _KEEPALIVE: dict = {"count": 0, "fail_streak": 0, "at": 0, "ok": None, "status":
 YUANBAO_TEMP_CONV = os.environ.get("YUANBAO_TEMP_CONV", "1")  # 1=临时会话(不进历史，反风控)；0=普通
 YB_DELETE_CONV = os.environ.get("YB_DELETE_CONV", "1")    # 1=生成完自动删除本次创建的会话（历史零残留）
 YB_CREATE_CONV = os.environ.get("YB_CREATE_CONV", "1")
+# 生图 prompt 前缀（真实浏览器抓包：图生图**不带**前置语，直接是用户原话）。
+# 默认保留历史行为，改语义前请先用干净号实测；设成空串即完全对齐浏览器。
+YB_IMAGE_PROMPT_PREFIX = os.environ.get("YB_IMAGE_PROMPT_PREFIX", "帮我生成图片：")
 YB_SIG_TTL = float(os.environ.get("YB_SIG_TTL", "60"))    # 签名三件套复用秒数（实测可复用，避免每请求铸签）
 YB_MINT_BACKEND = os.environ.get("YB_MINT_BACKEND", "cdp")  # cdp（默认，headless Chrome 铸签，无 bsk）| bsk（遗留）| http（远程 minter）
 YB_COOKIE_FILE = os.environ.get("YB_COOKIE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.txt"))  # 默认凭证文件（无 bsk 数据面）
@@ -284,13 +287,16 @@ YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙
 PORT = int(os.environ.get("YUANBAO_PROXY_PORT", "8177"))
 
 # 静态头骨架：易变字段（UA/os_version/webversion/commit-tag/设备三件）运行时从页面动态覆盖
+# 真实浏览器（Chrome 153 / macOS）POST 时**必发**的 client hints 三件套。
+# 🔴 缺这三条是很硬的"非浏览器"证据：真 Chrome 只要 UA 里是 Chrome，就一定会带上。
+#    且其值必须与 UA 的版本号一致（这里 UA 固定 Chrome/153 ⇒ v="153"）。
 STATIC_HEADERS = {
     "X-Input-Type": "text",
     "X-Requested-With": "XMLHttpRequest",
     "X-Instance-ID": "5",
     "X-Source": "web",
     "X-Language": "zh-CN",
-    "X-device-id": "19c100d220910063ab8e4f54c0cba26e4d7c4bd2b8",  # 动态覆盖
+    "X-device-id": "",          # 动态覆盖为 _qimei_uuid42（与 X-HY93 同值）；空则由下面兜底
     "X-HY106": "",
     "X-os_version": "Mac OS(10.15.7)-Blink",                     # 动态覆盖
     "X-Platform": "mac",
@@ -301,6 +307,12 @@ STATIC_HEADERS = {
     "X-Web-Third-Source": "main",
     "x-commit-tag": "02746073",                                  # 动态覆盖
     "X-WebVersion": "2.87.2",                                    # 动态覆盖
+    "X-Trid-Channel": "undefined",
+    # --- 以下三项来自真实抓包，原来完全缺失 ---
+    "sec-ch-ua": '"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"macOS"',
+    "chat_version": "v1",
 }
 
 # OpenAI 风格模型名 → 元宝 chatModelId
@@ -863,6 +875,11 @@ def _yb_headers(cookie: str, sig: Optional[dict], agent_id: str, conv: str = "",
         "user-agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36",
         "X-AgentID": (agent_id + "/" + conv) if conv else agent_id,
     })
+    # 真浏览器每个请求都带一个新的 traceparent（32 位 hex，无连字符）
+    h["X-Traceparent"] = uuid.uuid4().hex
+    # X-device-id 兜底：动态头没给（如铸签失败）时不要留空 —— 留空比给个假值更可疑
+    if not h.get("X-device-id"):
+        h["X-device-id"] = h.get("X-HY93") or "19c100d220910063ab8e4f54c0cba26e4d7c4bd2b8"
     if sig:
         h.update({"X-Uskey": sig["uskey"], "X-Bus-Params-Md5": sig["md5"], "X-Timestamp": sig["ts"]})
     if extra:
@@ -1660,7 +1677,7 @@ def _yb_chat_body(conv: str, agent_id: str, prompt: str, chat_model: str) -> dic
 def _yb_image_body(conv: str, agent_id: str, prompt: str, multimedia: list, resolution: str, chat_model: str, ratio: Optional[str] = None) -> dict:
     """生图 body（出站统一）：带 multimedia → i2i（msgScene 12）；无 → t2i（msgScene 13）。"""
     BASE = "hunyuan_gpt_175B_0404"
-    full_prompt = "帮我生成图片：" + prompt
+    full_prompt = (YB_IMAGE_PROMPT_PREFIX or "") + prompt
     igen = {"model": "Hy Image 3.5", "resolution": resolution or "1.5K"}
     if ratio:
         igen["ratio"] = ratio
@@ -1685,6 +1702,8 @@ def _yb_image_body(conv: str, agent_id: str, prompt: str, multimedia: list, reso
         "applicationIdList": ["application_id_ai_image"],
         "skillId": "ai_image", "chatSource": "ai_image",
         "version": "v2", "extReportParams": None, "isAtomInput": False,
+        # 真实抓包里有 realPrompt（= 用户原话，不含前置语）
+        "realPrompt": prompt,
         "conversationId": conv,
         "offsetOfHour": 8, "offsetOfMinute": 0,
     }
@@ -2368,6 +2387,19 @@ async def admin_egress(req: Request):
             out["browser_ip"] = (ip or "").strip() or None
         except Exception as e:
             out["browser_ip"] = "ERR: %s" % str(e)[:120]
+
+    # 动态指纹可见性：确认 X-HY92(h38) / X-HY93+X-device-id(uuid42) 真的采到了。
+    # 这三者必须同源（同一设备），否则"签名来自 A 设备、device-id 是 B 设备"自相矛盾。
+    try:
+        await asyncio.to_thread(get_sig, None, False)
+    except Exception:
+        pass
+    _dyn = _DYN_HEADERS or {}
+    out["dyn_ok"] = bool(_dyn.get("X-HY92") and _dyn.get("X-HY93"))
+    out["h38"] = (_dyn.get("X-HY92") or "")[:8]
+    out["uuid42"] = (_dyn.get("X-HY93") or "")[:8]
+    out["device_id_consistent"] = bool(_dyn.get("X-HY93")
+                                       and _dyn.get("X-device-id") == _dyn.get("X-HY93"))
 
     ok = bool(out["data_ip"] and out["browser_ip"]
               and out["data_ip"] == out["browser_ip"])
@@ -4661,14 +4693,26 @@ async def chat_completions(req: Request):
     return resp
 
 
+# 上游 Hy Image 3.5 的分辨率档位，来自 `/api/info/general` 的
+# `pcAiCreateList[0].resolutionList = ["1.5K","2K"]`（2026-10-21 抓包）。
+# 🔴 没有 4K。请求 4K 必须**夹到 2K**（历史上会落到 1.5K，比 2K 还小，属实现 bug）。
+RES_MAX = "2K"
+_RES_1K = re.compile(r"^(1k|1024x1024|512|512x512)")
+_RES_2K = re.compile(r"^(2k|2048|1792|1920)")
+_RES_OVER = re.compile(r"^(4k|4096|3840|2160|2560|2880)")
+
+
 def _size_to_resolution(size: str) -> str:
     if not size:
         return "1.5K"
     s = size.lower()
-    if re.match(r"^(1k|1024x1024|512|512x512)", s):
-        return "1K"
-    if re.match(r"^(2k|2048|1792|1920)", s):
+    if _RES_OVER.match(s):
+        print("[size] %s 超过上游上限（%s），已夹到 %s" % (size, RES_MAX, RES_MAX), flush=True)
+        return RES_MAX
+    if _RES_2K.match(s):
         return "2K"
+    if _RES_1K.match(s):
+        return "1K"
     return "1.5K"
 
 

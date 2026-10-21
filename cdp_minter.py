@@ -92,7 +92,7 @@ MINT_JS = """
 
 FP_JS = """
 (() => {
-  let ver = null, tag = null, h38 = null;
+  let ver = null, tag = null, h38 = null, u42 = null;
   try {
     const arrs = Object.keys(window).filter(k => k.startsWith("webpackChunk"));
     const arr = window[arrs[0]];
@@ -100,7 +100,10 @@ FP_JS = """
     const sdk = req(77004).I5(req(77004).PU);
     const q = sdk.getLocalQimei36();
     h38 = q ? q.h38 : null;
+    u42 = (q && (q.uuid42 || q.uuid)) || null;
   } catch (e) {}
+  // _qimei_uuid42 就是真实请求里的 X-device-id / X-HY93（实测与抓包完全一致）
+  if (!u42) { try { u42 = localStorage.getItem('_qimei_uuid42'); } catch (e) {} }
   try {
     for (const e of performance.getEntriesByType('resource')) {
       const m = (e.name || '').match(/version=([\d.]+)__([0-9a-f]+)-/);
@@ -113,7 +116,7 @@ FP_JS = """
     const m = ua.match(/Mac OS X ([\d_]+)/);
     if (m) osv = 'Mac OS(' + m[1].replace(/_/g, '.') + ')-Blink';
   }
-  return {ver, tag, osv, ua, h38};
+  return {ver, tag, osv, ua, h38, u42};
 })()
 """
 

@@ -49,7 +49,10 @@ def i1():
 def i2():
     print("[I2] size 映射")
     for size, res in (("1024x1024", "1K"), ("512x512", "1K"), ("1k", "1K"),
-                      ("", "1.5K"), ("auto", "1.5K"), ("1792x1024", "2K"), ("2048x2048", "2K")):
+                      ("", "1.5K"), ("auto", "1.5K"), ("1792x1024", "2K"), ("2048x2048", "2K"),
+                      # 4K 不存在于上游档位（resolutionList=["1.5K","2K"]）⇒ 必须夹到 2K，
+                      # 不能掉到 1.5K（比 2K 还小，属实现 bug）
+                      ("4k", "2K"), ("4096x4096", "2K"), ("3840x2160", "2K")):
         got = ybp._size_to_resolution(size)
         check("I2 res %-12s → %s" % (size or "(空)", res), got == res, "got=%s" % got)
     for size, ratio in (("", None), ("auto", None), ("16:9", "16:9"), ("1024x1024", "1:1"),

@@ -1,0 +1,114 @@
+{
+  "_source": "2026-10-21 元宝「AI 创作」页 · 图生图（msgScene 12）· Chrome 153 / macOS，用户在 devtools 里 copy as cURL 得到的真实请求",
+  "_note": "长凭据（uskey/md5/timestamp/h38/device-id）已脱敏为占位符；本文件只用于校验**字段覆盖度与形态**，不用于重放",
+  "method": "POST",
+  "endpoint": "/api/chat/0RQHql4zf1c",
+  "content_type": "text/plain;charset=UTF-8",
+  "headers": {
+    "sec-ch-ua": "\"Google Chrome\";v=\"153\", \"Not_A Brand\";v=\"8\", \"Chromium\";v=\"153\"",
+    "X-Instance-ID": "5",
+    "X-Event-Input-Type": "14",
+    "sec-ch-ua-mobile": "?0",
+    "Content-Type": "text/plain;charset=UTF-8",
+    "x-commit-tag": "7a0c0e99",
+    "X-Uskey": "<REDACTED-uskey>",
+    "chat_version": "v1",
+    "X-Input-Type": "text",
+    "X-Bus-Params-Md5": "<REDACTED-md5>",
+    "X-Web-Third-Source": "main",
+    "Referer": "https://yuanbao.tencent.com/chat/naQivTmsDa/0RQHql4zf1c",
+    "X-Traceparent": "<REDACTED-traceparent>",
+    "X-ybuitest": "0",
+    "X-WebVersion": "2.89.1",
+    "X-HY93": "<REDACTED-uuid42>",
+    "sec-ch-ua-platform": "\"macOS\"",
+    "X-device-id": "<REDACTED-uuid42>",
+    "X-Language": "zh-CN",
+    "X-Requested-With": "XMLHttpRequest",
+    "X-AgentID": "naQivTmsDa/0RQHql4zf1c",
+    "X-Trid-Channel": "undefined",
+    "X-Exp-Params": "enableNewPcStyle=2",
+    "X-Platform": "mac",
+    "X-os_version": "Mac OS(10.15.7)-Blink",
+    "X-Source": "web",
+    "X-Timestamp": "<REDACTED-ms>",
+    "X-HY92": "<REDACTED-h38>",
+    "x-web-ch-id": "null",
+    "X-webdriver": "0",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+  },
+  "body": {
+    "model": "gpt_175B_0404",
+    "prompt": "参考上传图生成图片：保持上传图比例不变，原图场景、人物五官、表情、皮肤、服饰、动作不变。仅调整人物眼睫毛：分段式仙子毛假睫毛。",
+    "plugin": "",
+    "displayPrompt": "参考上传图生成图片：保持上传图比例不变，原图场景、人物五官、表情、皮肤、服饰、动作不变。仅调整人物眼睫毛：分段式仙子毛假睫毛。",
+    "displayPromptType": 1,
+    "question": "参考上传图生成图片：保持上传图比例不变，原图场景、人物五官、表情、皮肤、服饰、动作不变。仅调整人物眼睫毛：分段式仙子毛假睫毛。",
+    "skillIdParam": "ai_image",
+    "msgScene": 12,
+    "chatModelId": "hunyuan_omnipotent",
+    "chatModelExtInfo": "{\"modelId\":\"hunyuan_gpt_175B_0404\",\"supportFunctions\":{\"internetSearch\":\"\"},\"internetSearch\":\"autoInternetSearch\"}",
+    "PromptParam": [
+      {
+        "slot": "立体睫毛",
+        "slotId": "6191814e0852458b8dbc530574561409",
+        "tabId": "134592465a8a4336939cd666ef2b8b8a"
+      }
+    ],
+    "extra": {
+      "image_gen_param": {
+        "model": "Hy Image 3.5",
+        "resolution": "2K"
+      }
+    },
+    "agentId": "naQivTmsDa",
+    "isTemporary": false,
+    "projectId": "",
+    "supportFunctions": [
+      "openAutoSearchSwitch",
+      "autoInternetSearch"
+    ],
+    "docOpenid": "",
+    "options": {
+      "imageIntention": {
+        "needIntentionModel": true,
+        "backendUpdateFlag": 2,
+        "intentionStatus": true
+      }
+    },
+    "multimedia": [
+      {
+        "type": "image",
+        "docType": "image",
+        "url": "https://cdn-pro.yuanbao.tencent.com/public/pro/ZGFlY2Y3NTEtZjk4Ni00MWE2LWEyMmQtNzFmMDdmZDMyMjA2_compress.webp?width=1266&height=1686",
+        "fileName": "ZGFlY2Y3NTEtZjk4Ni00MWE2LWEyMmQtNzFmMDdmZDMyMjA2_compress.webp",
+        "size": 0,
+        "width": 0,
+        "height": 0,
+        "fileId": "creation-template:6191814e0852458b8dbc530574561409%3A0",
+        "uploadStatus": "success",
+        "progress": 100
+      }
+    ],
+    "supportHint": 1,
+    "applicationIdList": [],
+    "skillId": "ai_image",
+    "chatSource": "ai_create_tab",
+    "version": "v2",
+    "extReportParams": null,
+    "isAtomInput": false,
+    "realPrompt": "参考上传图生成图片：保持上传图比例不变，原图场景、人物五官、表情、皮肤、服饰、动作不变。仅调整人物眼睫毛：分段式仙子毛假睫毛。",
+    "conversationId": "0RQHql4zf1c",
+    "offsetOfHour": 8,
+    "offsetOfMinute": 0
+  },
+  "observed_differences_vs_our_impl": {
+    "chatModelId": "抓包为 hunyuan_omnipotent（创作 tab）；我们是 hunyuan_gpt_175B_0404（聊天页 ai_image 入口）",
+    "chatSource": "抓包为 ai_create_tab；我们是 ai_image",
+    "applicationIdList": "抓包为 []；我们是 [\"application_id_ai_image\"]",
+    "plugin": "抓包为 \"\"；我们是 \"Adaptive\"",
+    "isTemporary": "抓包为 false；我们默认 true（临时会话，反风控：不留历史）",
+    "X-Event-Input-Type": "抓包为 14；我们是 15",
+    "prompt": "抓包无前置语；我们默认加「帮我生成图片：」（可用 YB_IMAGE_PROMPT_PREFIX 置空对齐）"
+  }
+}

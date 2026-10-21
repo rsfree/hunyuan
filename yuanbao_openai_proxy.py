@@ -1248,6 +1248,26 @@ def get_sig(tab: str, force: bool = False) -> dict:
 
 
 _last_lock = threading.Lock()    # 保护 _last_req_at（预约发车时刻）
+
+
+def _acct_key(cookie: str) -> str:
+    """凭证的**账号级**标识 —— 限速队列与并发槽都按它分桶。
+
+    🔴 绝不能用 `cookie[:16]`：元宝 cookie 全都以 `hy_source=web; hy_user=...` 开头，
+       前 16 个字符对所有账号**完全相同**（实测 `hy_source=web; h`）
+       ⇒ 所有号会共用同一个限速队列和同一组并发槽：
+         ① 号 A 发车后号 B 得等 2~3.5s（本来可以并行）
+         ② 全池只有 5 个并发槽，加号完全不扩容
+    优先取 `hy_user`（账号唯一标识），取不到才退回 cookie 指纹。
+    """
+    m = re.search(r"(?:^|;\s*)hy_user=([^;]{1,64})", cookie or "")
+    if m:
+        return "ck:" + m.group(1).strip()
+    try:
+        import hashlib
+        return "ck:" + hashlib.sha1((cookie or "").encode("utf-8")).hexdigest()[:16]
+    except Exception:
+        return "ck:" + (cookie or "")[:32]
 _ACCT_SEMS = {}                  # key -> Semaphore（按凭证）
 _ACCT_SEMS_LOCK = threading.Lock()
 
@@ -1770,7 +1790,7 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
     两道闸的顺序很关键：先 `pace()` 排队（等待不占并发槽），再抢并发槽；
     反过来会让排队中的请求白占名额，实际并发数远低于配置值。
     """
-    pkey = "ck:" + cookie[:16]
+    pkey = _acct_key(cookie)          # 账号级分桶（不能用 cookie 前缀，见 _acct_key 注释）
     pace(pkey)
     sem = acct_slot(pkey)
     sem.acquire()
@@ -1870,7 +1890,7 @@ def _cookie_mode_stream(cookie: str, agent_id: str, prompt: str, chat_model: str
       {"finish": "stop"}                                # 正常结束
     本次创建的会话在结束（含客户端中断触发 GeneratorExit）时统一删除。
     软拒（"服务繁忙"）且**尚无内容产出**时退避重试（重铸签名）。"""
-    pkey = "ck:" + cookie[:16]
+    pkey = _acct_key(cookie)        # 账号级分桶
     pace(pkey)                      # 先排队（等待不占并发槽）
     if tab is None and YB_MINT_BACKEND != "cdp":
         tab = _ensure_page()["tabId"]

@@ -178,8 +178,40 @@ def c6():
     check("C6 新配置项存在", "YB_ACCT_CONCURRENCY" in src)
 
 
+def c7():
+    """凭证分桶必须按**账号**（hy_user），不能按 cookie 前缀。
+
+    真实事故：`cookie[:16]` 对所有元宝账号都是 `hy_source=web; h`
+    ⇒ 全池共用同一个限速队列 + 同一组并发槽 ⇒ 加号完全不扩容。
+    """
+    print("[C7] 凭证分桶按 hy_user（不能用 cookie 前缀）")
+    ck_a = "hy_source=web; hy_user=aaaa1111; hy_token=t1"
+    ck_b = "hy_source=web; hy_user=bbbb2222; hy_token=t2"
+    ka, kb = ybp._acct_key(ck_a), ybp._acct_key(ck_b)
+    check("C7 两个号前缀相同（复现前提）", ck_a[:16] == ck_b[:16], ck_a[:16])
+    check("C7 但 key 不同", ka != kb, "%s vs %s" % (ka, kb))
+    check("C7 key 用 hy_user", ka == "ck:aaaa1111", ka)
+
+    # 同一个号换 cookie（token 变了）⇒ 仍是同一个桶
+    ck_a2 = "hy_source=web; hy_user=aaaa1111; hy_token=NEWTOKEN"
+    check("C7 同号换 token 仍是同一桶", ybp._acct_key(ck_a2) == ka, ybp._acct_key(ck_a2))
+
+    # 无 hy_user ⇒ 退回指纹，且不同输入不同 key
+    check("C7 无 hy_user 不崩", ybp._acct_key("foo=1; bar=2").startswith("ck:"))
+    check("C7 无 hy_user 时不同输入不同 key",
+          ybp._acct_key("foo=1") != ybp._acct_key("foo=2"))
+
+    # 真实形态：不同号的并发槽必须互相独立
+    real = ybp.YB_ACCT_CONCURRENCY
+    try:
+        ybp.YB_ACCT_CONCURRENCY = 1
+        check("C7 两号各自独立闸门", ybp.acct_slot(ka) is not ybp.acct_slot(kb))
+    finally:
+        ybp.YB_ACCT_CONCURRENCY = real
+
+
 if __name__ == "__main__":
-    c1(); c2(); c3(); c4(); c5(); c6()
+    c1(); c2(); c3(); c4(); c5(); c6(); c7()
     print()
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), FAILS))

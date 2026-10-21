@@ -5128,6 +5128,21 @@ def _ci_supported(url: str) -> bool:
     return ok
 
 
+def _fetch_b64(url: str, timeout: int = 180) -> str:
+    """下载图片 → base64（OpenAI `response_format=b64_json` 用）。
+
+    走 `_open`（本号出口），与业务请求同一条链路 —— 裸直连在容器里可能拿不到 CDN。
+    注意顺序：必须在 `_maybe_upscale` 之后调用，否则拿到的是未放大的图。
+    """
+    import base64 as _b64
+    req = _ureq.Request(url, headers={"user-agent": "Mozilla/5.0"})
+    with _open(req, timeout=timeout) as r:
+        blob = r.read()
+    if not blob:
+        raise RuntimeError("下载为空")
+    return _b64.b64encode(blob).decode()
+
+
 def _maybe_upscale(urls: list, size: str) -> tuple:
     """客户端要 >2K → 给每个图 URL 追加一级 CI 放大。返回 (urls, info|None)。
 
@@ -5408,6 +5423,23 @@ async def _images_core(req: Request, body: dict, image_refs_in=None):
         data = data[:n]
     # 上游 image_gen_param 里没有"数量"字段 ⇒ 一次只出 1 张（除非它自己回多变体）。
     # `n` 只做上限截断（data[:n]），不循环请求凑数量 —— 那是拿封号风险换数量。
+    # ---- response_format：OpenAI 标准二选一（url 默认 / b64_json）----
+    # 🔴 new-api 与多数客户端（Cherry Studio / NextChat / 各家 SDK）在图片场景默认要 b64_json；
+    #    不支持的话客户端拿到 url 却按 b64 解析，直接报错或显示裂图。
+    fmt = str(body.get("response_format") or "url").strip().lower()
+    if fmt in ("b64_json", "b64"):
+        for _it in data:
+            _u = _it.pop("url", None)
+            if not _u:
+                continue
+            try:
+                _it["b64_json"] = _fetch_b64(_u)
+            except Exception as _e:
+                # 下载失败退回 url（宁可格式不标准，也不能给客户端一个空图）
+                _it["url"] = _u
+                _it["b64_error"] = str(_e)[:120]
+                print("[images] b64_json 转换失败（已退回 url）: %s" % str(_e)[:120], flush=True)
+
     payload = {"created": created, "data": data}
     if _up:
         payload["upscale"] = _up

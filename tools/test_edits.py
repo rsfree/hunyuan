@@ -334,8 +334,73 @@ def e8():
         ybp._cookie_mode_run, ybp._check_auth = real_run, real_auth
 
 
+def e9():
+    print("[E9] response_format（OpenAI 标准：url 默认 / b64_json）")
+    real_run, real_auth, real_b64 = ybp._cookie_mode_run, ybp._check_auth, ybp._fetch_b64
+    real_up, real_ci = ybp.YB_UPSCALE_ENABLE, ybp._ci_supported
+    seen_b64 = []
+    try:
+        ybp._check_auth = lambda req: ("cookie", "hy_user=x; hy_token=y")
+        ybp._want_pool_route = lambda req: False
+        _patch_downstream([])
+        ybp._ci_supported = lambda u: True       # 假装图床支持 CI，验证"先放大再转 b64"
+        ybp.YB_UPSCALE_ENABLE = True
+
+        def fake_b64(url, timeout=180):
+            seen_b64.append(url)
+            return "QkFTRTY0"
+        ybp._fetch_b64 = fake_b64
+        c = _client()
+
+        # ① 不传 response_format ⇒ 默认 url
+        r = c.post("/v1/images/generations",
+                   json={"model": "hy-image-3.5", "prompt": "柯基", "size": "2048x2048"})
+        d = (r.json().get("data") or [{}])[0]
+        check("E9 默认返回 url", "url" in d and "b64_json" not in d, str(list(d.keys())))
+
+        # ② response_format=b64_json ⇒ 只给 b64_json（不带 url）
+        seen_b64[:] = []
+        r = c.post("/v1/images/generations",
+                   json={"model": "hy-image-3.5", "prompt": "柯基", "size": "2048x2048",
+                         "response_format": "b64_json"})
+        d = (r.json().get("data") or [{}])[0]
+        check("E9 b64 返回 b64_json", d.get("b64_json") == "QkFTRTY0", str(list(d.keys())))
+        check("E9 b64 不再带 url", "url" not in d, str(list(d.keys())))
+
+        # ③ 放大必须发生在转 b64 之前（否则客户端拿到的是未放大的图）
+        seen_b64[:] = []
+        r = c.post("/v1/images/generations",
+                   json={"model": "hy-image-3.5", "prompt": "柯基", "size": "4k",
+                         "response_format": "b64_json"})
+        check("E9 4k 时转的是放大后的 URL", seen_b64 and "imageMogr2" in seen_b64[0],
+              seen_b64[0][:90] if seen_b64 else "没调用")
+
+        # ④ 下载失败 ⇒ 退回 url，并带 b64_error（不给空图）
+        def boom(url, timeout=180):
+            raise RuntimeError("cdn timeout")
+        ybp._fetch_b64 = boom
+        r = c.post("/v1/images/generations",
+                   json={"model": "hy-image-3.5", "prompt": "柯基", "size": "2048x2048",
+                         "response_format": "b64_json"})
+        d = (r.json().get("data") or [{}])[0]
+        check("E9 失败退回 url", "url" in d and "b64_json" not in d, str(list(d.keys())))
+        check("E9 失败带 b64_error", "b64_error" in d, str(d.get("b64_error"))[:60])
+
+        # ⑤ edits 也吃 response_format
+        ybp._fetch_b64 = fake_b64
+        seen_b64[:] = []
+        r = c.post("/v1/images/edits",
+                   files={"image": ("r.png", PNG, "image/png")},
+                   data={"prompt": "改背景", "response_format": "b64_json"})
+        d = (r.json().get("data") or [{}])[0]
+        check("E9 edits 支持 b64_json", d.get("b64_json") == "QkFTRTY0", str(list(d.keys())))
+    finally:
+        ybp._cookie_mode_run, ybp._check_auth, ybp._fetch_b64 = real_run, real_auth, real_b64
+        ybp.YB_UPSCALE_ENABLE, ybp._ci_supported = real_up, real_ci
+
+
 if __name__ == "__main__":
-    e1(); e2(); e3(); e4(); e5(); e6(); e7(); e8()
+    e1(); e2(); e3(); e4(); e5(); e6(); e7(); e8(); e9()
     print()
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), FAILS))

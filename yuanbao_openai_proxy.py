@@ -4614,7 +4614,8 @@ async def chat_completions(req: Request):
         parts = []
         if result.get("text"):
             parts.append({"type": "text", "text": result["text"]})
-        for i, u in enumerate(result.get("urls") or []):
+        _urls, _up = _maybe_upscale(result.get("urls") or [], body.get("size", ""))
+        for i, u in enumerate(_urls):
             parts.append({"type": "image_url", "image_url": {"url": u}})
         if not parts:
             return JSONResponse({"error": {"message": "未获取到图片: " + str(result.get("raw"))[:200], "type": "api_error"}}, status_code=502)
@@ -4697,26 +4698,112 @@ async def chat_completions(req: Request):
 # `pcAiCreateList[0].resolutionList = ["1.5K","2K"]`（2026-10-21 抓包）。
 # 🔴 没有 4K。请求 4K 必须**夹到 2K**（历史上会落到 1.5K，比 2K 还小，属实现 bug）。
 RES_MAX = "2K"
-_RES_1K = re.compile(r"^(1k|1024x1024|512|512x512)")
-_RES_2K = re.compile(r"^(2k|2048|1792|1920)")
-_RES_OVER = re.compile(r"^(4k|4096|3840|2160|2560|2880)")
+# 客户端要 >2K 时，给返回的图片 URL 追加一级 CI 放大（元宝图床就是腾讯 COS+CI，实测支持 imageMogr2）
+YB_UPSCALE_ENABLE = os.environ.get("YB_UPSCALE_ENABLE", "1") == "1"
+YB_UPSCALE_MAX = int(os.environ.get("YB_UPSCALE_MAX", "4096"))   # 放大后最长边上限
 
 
 def _size_to_resolution(size: str) -> str:
-    if not size:
-        return "1.5K"
-    s = size.lower()
-    if _RES_OVER.match(s):
-        print("[size] %s 超过上游上限（%s），已夹到 %s" % (size, RES_MAX, RES_MAX), flush=True)
-        return RES_MAX
-    if _RES_2K.match(s):
-        return "2K"
-    if _RES_1K.match(s):
-        return "1K"
-    return "1.5K"
+    """上游**一律请求 2K**（档位上限 resolutionList=["1.5K","2K"]）。
+
+    客户端要更大的由 `_maybe_upscale` 在出图后走图床 CI 放大 —— 先拿满质量再放大，
+    比"让上游出小图再放大"整体更清晰；客户端要小的也不必降档（大图能缩，小图缩不回来）。
+    """
+    return RES_MAX
 
 
 _RATIO_SLOTS = {"1:1": 1.0, "4:3": 4 / 3, "3:4": 3 / 4, "16:9": 16 / 9, "9:16": 9 / 16}
+
+
+def _size_to_target_box(size: str) -> Optional[tuple]:
+    """客户端要求的输出尺寸 → 放大目标框 (W,H)；≤2K 或无法解析时返回 None（不放大）。"""
+    if not size:
+        return None
+    s = size.strip().lower()
+    if s in ("auto", "smart", "1k", "2k"):
+        return None
+    m = re.match(r"^(\d{2,4})x(\d{2,4})$", s)
+    if m:
+        w, h = int(m.group(1)), int(m.group(2))
+    elif s in ("4k", "8k"):
+        w = h = 4096 if s == "4k" else 7680
+    else:
+        return None
+    if w <= 0 or h <= 0 or max(w, h) <= 2048:
+        return None
+    cap = max(2048, YB_UPSCALE_MAX)
+    if max(w, h) > cap:                       # 等比夹到上限
+        k = cap / float(max(w, h))
+        w, h = max(1, int(w * k)), max(1, int(h * k))
+    return (w, h)
+
+
+def _ci_join(url: str, op: str) -> str:
+    """把 CI 算符拼到 URL 上（已有 query 用 &，否则用 ?）。"""
+    sep = "&" if ("?" in url) else "?"
+    return url + sep + op
+
+
+_CI_CACHE: dict = {}          # host -> (supported: bool, at: float)
+_CI_TTL = 6 * 3600
+
+
+def _host_of(url: str) -> str:
+    try:
+        return url.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0]
+    except Exception:
+        return ""
+
+
+def _ci_supported(url: str) -> bool:
+    """该图床是否真的支持 imageMogr2（按 host 缓存 6h）。
+
+    判据：请求 `thumbnail/!64x64r`，产物必然很小（几十 KB 以内）。
+    若算符被忽略，返回的就是原图（2K 起，通常 ≥90KB）⇒ 用 Content-Length 阈值即可区分。
+    """
+    host = _host_of(url)
+    if not host:
+        return False
+    v = _CI_CACHE.get(host)
+    if v and (time.time() - v[1]) < _CI_TTL:
+        return v[0]
+    ok = False
+    try:
+        rq = _ureq.Request(_ci_join(url, "imageMogr2/thumbnail/!64x64r"),
+                           headers={"Accept": "image/*"})
+        with _open(rq, timeout=20) as r:
+            n = int(r.headers.get("Content-Length") or 0)
+            if not n:
+                n = len(r.read())
+            ok = 0 < n <= 30000
+    except Exception:
+        ok = False
+    _CI_CACHE[host] = (ok, time.time())
+    print("[upscale] CI 探测 %s → %s" % (host, "支持" if ok else "不支持"), flush=True)
+    return ok
+
+
+def _maybe_upscale(urls: list, size: str) -> tuple:
+    """客户端要 >2K → 给每个图 URL 追加一级 CI 放大。返回 (urls, info|None)。
+
+    ⚠️ 这是图床侧的**等比插值放大**（imageMogr2/thumbnail/!WxHr），不是 AI 超分；
+       实测 `ci-process=ImageSuperResolution` 在该桶返回 `Action mismatch`（未开通）。
+    """
+    box = _size_to_target_box(size) if YB_UPSCALE_ENABLE else None
+    if not box or not urls:
+        return urls, None
+    out, applied = [], 0
+    for u in urls:
+        if _ci_supported(u):
+            out.append(_ci_join(u, "imageMogr2/thumbnail/!%dx%dr" % box))
+            applied += 1
+        else:
+            out.append(u)
+    info = {"requested": size, "box": "%dx%d" % box,
+            "upscaled": applied, "total": len(urls),
+            "note": "图床等比插值放大（非 AI 超分）；不支持 CI 的图床原样返回"}
+    print("[upscale] %s → %dx%d：%d/%d 张已放大" % (size, box[0], box[1], applied, len(urls)), flush=True)
+    return out, info
 
 
 def _size_to_ratio(size: str) -> Optional[str]:
@@ -4849,6 +4936,8 @@ async def images_generations(req: Request):
     wm_urls = result.get("wmUrls") or []
     if not urls:
         return JSONResponse({"error": {"message": "未获取到图片: " + str(result.get("raw"))[:200], "type": "api_error"}}, status_code=502)
+    # 客户端要 >2K ⇒ 出图后追加一级 CI 放大（上游固定 2K，见 _size_to_resolution）
+    urls, _up = _maybe_upscale(urls, body.get("size", ""))
 
     # url = 无水印原图(originUrl/_h0_)；url_watermarked = 带"混元AI生成"水印版(_h1_)
     data = []
@@ -4859,7 +4948,14 @@ async def images_generations(req: Request):
         data.append(item)
     if n < len(data):
         data = data[:n]
-    return {"created": created, "data": data}
+    payload = {"created": created, "data": data}
+    if _up:
+        payload["upscale"] = _up
+    resp = JSONResponse(payload)
+    if _up:
+        resp.headers["X-YB-Upscale"] = "%s -> %s (%d/%d)" % (
+            _up.get("requested"), _up.get("box"), _up.get("upscaled"), _up.get("total"))
+    return resp
 
 
 if __name__ == "__main__":

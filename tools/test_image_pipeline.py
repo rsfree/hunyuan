@@ -48,13 +48,11 @@ def i1():
 
 def i2():
     print("[I2] size 映射")
-    for size, res in (("1024x1024", "1K"), ("512x512", "1K"), ("1k", "1K"),
-                      ("", "1.5K"), ("auto", "1.5K"), ("1792x1024", "2K"), ("2048x2048", "2K"),
-                      # 4K 不存在于上游档位（resolutionList=["1.5K","2K"]）⇒ 必须夹到 2K，
-                      # 不能掉到 1.5K（比 2K 还小，属实现 bug）
-                      ("4k", "2K"), ("4096x4096", "2K"), ("3840x2160", "2K")):
+    # 上游档位只有 1.5K / 2K（resolutionList），且要求**一律请求 2K**：
+    # 客户端要更大的由 CI 出图后放大，要更小的也不必降档（大图能缩、小图缩不回来）
+    for size in ("", "auto", "1k", "2k", "1024x1024", "2048x2048", "4k", "4096x4096", "8192x8192"):
         got = ybp._size_to_resolution(size)
-        check("I2 res %-12s → %s" % (size or "(空)", res), got == res, "got=%s" % got)
+        check("I2 res %-12s → 2K" % (size or "(空)"), got == "2K", "got=%s" % got)
     for size, ratio in (("", None), ("auto", None), ("16:9", "16:9"), ("1024x1024", "1:1"),
                         ("1024x768", "4:3"), ("768x1024", "3:4"), ("1792x1024", "16:9")):
         got = ybp._size_to_ratio(size)
@@ -160,8 +158,51 @@ def i6():
     check("I6 n 上限 4（min(n,4) 语义）", min(int(9), 4) == 4)
 
 
+def i7():
+    print("[I7] >2K 放大（CI）")
+    box = ybp._size_to_target_box
+    for size, want in (("", None), ("auto", None), ("1k", None), ("2k", None),
+                       ("1024x1024", None), ("2048x2048", None),
+                       ("4k", (4096, 4096)), ("4096x4096", (4096, 4096)),
+                       ("3840x2160", (3840, 2160)), ("2560x1440", (2560, 1440))):
+        got = box(size)
+        check("I7 box %-12s → %s" % (size or "(空)", want), got == want, "got=%s" % (got,))
+    # 超上限等比夹紧
+    ybp.YB_UPSCALE_MAX = 4096
+    got = box("8192x8192")
+    check("I7 8192 夹到 4096", got == (4096, 4096), "%s" % (got,))
+    check("I7 8192x4096 等比夹紧", box("8192x4096") == (4096, 2048), "%s" % (box("8192x4096"),))
+
+    check("I7 ci_join 无 query", ybp._ci_join("https://a/b.png", "op") == "https://a/b.png?op")
+    check("I7 ci_join 有 query",
+          ybp._ci_join("https://a/b.png?width=1", "op") == "https://a/b.png?width=1&op")
+    check("I7 host 解析", ybp._host_of("https://cdn-pro.yuanbao.tencent.com/x/y.png?a=1")
+          == "cdn-pro.yuanbao.tencent.com")
+
+    # _maybe_upscale：支持 CI 的图床才改写
+    real = ybp._ci_supported
+    try:
+        ybp._ci_supported = lambda u: "ok-host" in u
+        urls, info = ybp._maybe_upscale(
+            ["https://ok-host/a.png", "https://no-host/b.png"], "4k")
+        check("I7 只改写支持的图床", urls[0].endswith("imageMogr2/thumbnail/!4096x4096r")
+              and urls[1] == "https://no-host/b.png", "%s" % urls)
+        check("I7 info 统计正确", info["upscaled"] == 1 and info["total"] == 2, "%s" % (info,))
+        check("I7 标注非 AI 超分", "非 AI 超分" in info["note"], info["note"])
+        # ≤2K 不动
+        u2, i2 = ybp._maybe_upscale(["https://ok-host/a.png"], "1024x1024")
+        check("I7 ≤2K 不改写", u2 == ["https://ok-host/a.png"] and i2 is None, "%s" % (u2,))
+        # 关闭开关
+        ybp.YB_UPSCALE_ENABLE = False
+        u3, i3 = ybp._maybe_upscale(["https://ok-host/a.png"], "4k")
+        check("I7 开关关闭生效", u3 == ["https://ok-host/a.png"] and i3 is None)
+        ybp.YB_UPSCALE_ENABLE = True
+    finally:
+        ybp._ci_supported = real
+
+
 if __name__ == "__main__":
-    i1(); i2(); i3(); i4(); i5(); i6()
+    i1(); i2(); i3(); i4(); i5(); i6(); i7()
     print("\n%s  %d 项失败" % ("❌" if FAILS else "✅ 全部通过", len(FAILS)))
     for f in FAILS:
         print("   -", f)

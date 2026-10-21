@@ -90,9 +90,9 @@ MINT_JS = """
 })()
 """
 
-FP_JS = """
+FP_JS = r"""
 (() => {
-  let ver = null, tag = null, h38 = null, u42 = null;
+  let ver = null, tag = window.__BOT_COMMIT_ID__ || null, h38 = null, u42 = null;
   try {
     const arrs = Object.keys(window).filter(k => k.startsWith("webpackChunk"));
     const arr = window[arrs[0]];
@@ -104,12 +104,24 @@ FP_JS = """
   } catch (e) {}
   // _qimei_uuid42 就是真实请求里的 X-device-id / X-HY93（实测与抓包完全一致）
   if (!u42) { try { u42 = localStorage.getItem('_qimei_uuid42'); } catch (e) {} }
+  // 版本号 + commit 来自 RUM 埋点 URL：...&version=2.67.1__dfd04310&aid=...
+  // 🔴 原正则结尾写成 `-`（URL 里是 `&`），永远匹配不上 ⇒ ver/tag 恒为 null，
+  //    静默退回硬编码值。这就是"版本号长期不更新"的根因。
   try {
     for (const e of performance.getEntriesByType('resource')) {
-      const m = (e.name || '').match(/version=([\d.]+)__([0-9a-f]+)-/);
+      const m = (e.name || '').match(/[?&]version=([\d.]+)__([0-9a-f]{6,})/);
       if (m) { ver = m[1]; tag = m[2]; break; }
     }
   } catch (e) {}
+  // 兜底 1：版本号从同一份 RUM 的 app_version 取（即使 __commit 段格式再变也能拿到版本）
+  if (!ver) {
+    try {
+      for (const e of performance.getEntriesByType('resource')) {
+        const m = (e.name || '').match(/[?&]app_version=([\d.]+)/);
+        if (m) { ver = m[1]; break; }
+      }
+    } catch (e) {}
+  }
   const ua = navigator.userAgent;
   let osv = 'Mac OS(10.15.7)-Blink';
   if (ua.includes('Mac OS X')) {

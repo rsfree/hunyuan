@@ -388,8 +388,8 @@ STATIC_HEADERS = {
     "X-Exp-Params": "enableNewPcStyle=2",
     "x-web-ch-id": "null",
     "X-Web-Third-Source": "main",
-    "x-commit-tag": "02746073",                                  # 动态覆盖
-    "X-WebVersion": "2.87.2",                                    # 动态覆盖
+    "x-commit-tag": "dfd04310",                                  # 动态覆盖（2026-10-22 实测值，仅兜底）
+    "X-WebVersion": "2.67.1",                                     # 动态覆盖（2026-10-22 实测值，仅兜底）
     "X-Trid-Channel": "undefined",
     # --- 以下三项来自真实抓包，原来完全缺失 ---
     "sec-ch-ua": '"Google Chrome";v="153", "Not_A Brand";v="8", "Chromium";v="153"',
@@ -2752,6 +2752,10 @@ async def admin_egress(req: Request):
     out["uuid42"] = (_dyn.get("X-HY93") or "")[:8]
     out["device_id_consistent"] = bool(_dyn.get("X-HY93")
                                        and _dyn.get("X-device-id") == _dyn.get("X-HY93"))
+    # 版本号：站点升级后这两个值必须跟着变，否则是"客户端版本长期落后"的硬特征
+    out["web_version"] = _dyn.get("X-WebVersion") or STATIC_HEADERS.get("X-WebVersion")
+    out["commit_tag"] = _dyn.get("x-commit-tag") or STATIC_HEADERS.get("x-commit-tag")
+    out["version_dynamic"] = bool(_dyn.get("X-WebVersion") and _dyn.get("x-commit-tag"))
 
     ok = bool(out["data_ip"] and out["browser_ip"]
               and out["data_ip"] == out["browser_ip"])

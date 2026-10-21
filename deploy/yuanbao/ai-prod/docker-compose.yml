@@ -87,8 +87,10 @@ services:
       YB_OFFHOURS_SLOW: "${YB_OFFHOURS_SLOW:-3}"
       # slow=窗口外只降速；block=窗口外直接拒绝生图
       YB_OFFHOURS_MODE: "${YB_OFFHOURS_MODE:-slow}"
-      # 生图单独一道更窄的并发闸：人类一次只生成一张，同瞬 5 张是最明显的脚本特征
-      YB_IMAGE_CONCURRENCY: "${YB_IMAGE_CONCURRENCY:-2}"
+      # 并发完全可配：0 = 不限制（只靠 YB_MIN_INTERVAL + 抖动节流）
+      # 生图默认**放开**（0 = 与聊天共用 YB_ACCT_CONCURRENCY）；想吃"人类一次只生成一张"
+      # 那层防护时设成 1~2
+      YB_IMAGE_CONCURRENCY: "${YB_IMAGE_CONCURRENCY:-0}"
       # 生图结束后的"看结果"停顿区间（秒），0=关
       YB_IMAGE_COOL: "${YB_IMAGE_COOL:-4-10}"
       # 连续失败的指数退避基数/上限（秒），0=关

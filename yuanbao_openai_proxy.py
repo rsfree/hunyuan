@@ -353,7 +353,8 @@ YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两�
 # 与 YB_MIN_INTERVAL 是两道不同的闸：间隔管"发车节奏"，并发数管"同时有几个在路上"。
 YB_ACCT_CONCURRENCY = int(os.environ.get("YB_ACCT_CONCURRENCY", "5"))
 # 生图单独一道更窄的并发闸：人类一次只生成一张，并发 5 张是最明显的脚本特征
-YB_IMAGE_CONCURRENCY = int(os.environ.get("YB_IMAGE_CONCURRENCY", "2"))
+# 0 = 不单独限制（默认放开，与聊天共用 YB_ACCT_CONCURRENCY）；>0 才启用生图窄闸
+YB_IMAGE_CONCURRENCY = int(os.environ.get("YB_IMAGE_CONCURRENCY", "0"))
 # 活跃时间窗（"7-24"=早 7 点到 24 点；空=不启用）。窗口外只降速不拒绝，见 guard.Window
 YB_ACTIVE_HOURS = os.environ.get("YB_ACTIVE_HOURS", "")
 YB_OFFHOURS_SLOW = float(os.environ.get("YB_OFFHOURS_SLOW", "3"))   # 窗口外间隔倍率
@@ -1350,6 +1351,19 @@ def _acct_key(cookie: str) -> str:
         return "ck:" + hashlib.sha1((cookie or "").encode("utf-8")).hexdigest()[:16]
     except Exception:
         return "ck:" + (cookie or "")[:32]
+class _NoLimit:
+    """`YB_*_CONCURRENCY=0` 时用的空闸：acquire/release 都不阻塞。"""
+
+    _yb_limit = 0
+
+    def acquire(self, *a, **k):
+        return True
+
+    def release(self, *a, **k):
+        return None
+
+
+_NO_LIMIT = _NoLimit()
 _ACCT_SEMS = {}                  # key -> Semaphore（按凭证）
 _ACCT_SEMS_LOCK = threading.Lock()
 
@@ -1363,9 +1377,21 @@ def acct_slot(key: str, kind: str = "chat"):
     ⇒ 间隔 + 并发数两道闸配合：既像人，又不会把自己压垮。
 
     🔴 Semaphore 按 key 缓存并**跟随配置变化重建**（改 YB_ACCT_CONCURRENCY 后无需重启逻辑）。
+
+    并发**完全可配**（2026-10-22）：
+      `YB_ACCT_CONCURRENCY=0`  → 不限并发，只靠 `YB_MIN_INTERVAL`+抖动节流
+      `YB_IMAGE_CONCURRENCY=0` → 默认，生图不单独限制（与聊天共用一把闸）
+      `YB_IMAGE_CONCURRENCY=N` → 生图单独限制为 N（人类一次只生成一张那层防护）
     """
-    limit = max(1, YB_IMAGE_CONCURRENCY if kind == "image" else YB_ACCT_CONCURRENCY)
-    skey = (key, kind) if kind == "image" else key
+    if kind == "image" and YB_IMAGE_CONCURRENCY > 0:
+        limit = YB_IMAGE_CONCURRENCY
+        skey = (key, "image")            # 生图用独立窄闸
+    else:
+        # 默认：生图与聊天共用一把闸（image=0 时就是"不单独限制"）
+        limit = YB_ACCT_CONCURRENCY
+        skey = key
+    if limit <= 0:
+        return _NO_LIMIT                 # 0 = 完全不限并发，只靠 pace 节流
     with _ACCT_SEMS_LOCK:
         sem = _ACCT_SEMS.get(skey)
         if sem is None or getattr(sem, "_yb_limit", None) != limit:
@@ -2672,8 +2698,11 @@ async def admin_egress(req: Request):
     try:
         out["rhythm"] = dict(WINDOW.snapshot(), **BACKOFF.snapshot())
         out["rhythm"].update({
-            "image_concurrency": YB_IMAGE_CONCURRENCY,
-            "chat_concurrency": YB_ACCT_CONCURRENCY,
+            "image_concurrency": (YB_IMAGE_CONCURRENCY or YB_ACCT_CONCURRENCY or "unlimited"),
+            "image_concurrency_mode": ("独立窄闸" if YB_IMAGE_CONCURRENCY > 0
+                                       else ("不限并发" if YB_ACCT_CONCURRENCY <= 0
+                                             else "跟随聊天")),
+            "chat_concurrency": (YB_ACCT_CONCURRENCY or "unlimited"),
             "min_interval": YB_MIN_INTERVAL, "min_jitter": YB_MIN_JITTER,
             "image_cool": YB_IMAGE_COOL, "browse_every": YB_BROWSE_EVERY,
             "image_done": dict(_IMG_DONE_N)})

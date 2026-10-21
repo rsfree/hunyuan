@@ -108,12 +108,31 @@ m.YB_IMAGE_COOL = "4-10"
 m._IMG_COOL_UNTIL.clear()
 m._cookie_mode_run_inner = lambda *a, **k: {"status": 200, "urls": ["https://x/a.png"]}
 m.pace = lambda *a, **k: None                # 跳过等待，只看记账
+_real_slot = m.acct_slot                     # R7 要打桩，R8 还得用真的
 m.acct_slot = lambda *a, **k: type("S", (), {"acquire": lambda s: None, "release": lambda s: None})()
 m.BACKOFF = _g.Backoff(0.5, 5)
 m.BACKOFF.fail("ck:ZZ")
 m._cookie_mode_run("hy_source=web; hy_user=ZZ; a=1", "ag", "p", "hunyuan", ["ref"], "2K")
 ok("ck:ZZ" in m._IMG_COOL_UNTIL, "R7 生图成功后排冷却")
 ok(m.BACKOFF.wait("ck:ZZ") == 0, "R7 成功后清退避")
+
+# ---------- R8 并发可配置的三种口径 ----------
+m.acct_slot = _real_slot                     # 恢复真实实现
+m.YB_ACCT_CONCURRENCY = 5
+m.YB_IMAGE_CONCURRENCY = 0                     # 默认：生图不单独限制
+s_c, s_i = m.acct_slot("k8", "chat"), m.acct_slot("k8", "image")
+ok(s_c is s_i and s_c._yb_limit == 5, "R8 image=0 时与聊天共用一把闸（不是 5+5=10）",
+   "limit=%s same=%s" % (s_c._yb_limit, s_c is s_i))
+
+m.YB_ACCT_CONCURRENCY = 0                      # 完全放开
+nl = m.acct_slot("k9", "chat")
+ok(getattr(nl, "_yb_limit", None) == 0 and nl.acquire() and nl.release() is None,
+   "R8 chat=0 时返回空闸（不限并发）")
+
+m.YB_ACCT_CONCURRENCY = 5
+m.YB_IMAGE_CONCURRENCY = 1                     # 想吃窄闸就设 1
+si = m.acct_slot("k10", "image")
+ok(si._yb_limit == 1 and si is not m.acct_slot("k10", "chat"), "R8 image=1 启用独立窄闸")
 
 print("\n%s 通过 %d 项，失败 %d 项" % ("✅ 全部通过" if not FAIL else "❌ 有失败", PASS, FAIL))
 sys.exit(1 if FAIL else 0)

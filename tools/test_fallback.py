@@ -285,8 +285,64 @@ def f7():
     check("F7 pool_router 仍是普通函数", "async def pool_router(req: Request, rest: str):" in src)
 
 
+def f8():
+    print("[F8] 参考图下载走本号出口（不走裸 urlopen）")
+    src = open(os.path.join(ROOT, "yuanbao_openai_proxy.py"), encoding="utf-8").read()
+    seg_start = src.find("def _ref_to_data_uri(")
+    seg_end = src.find("def ", seg_start + 10)
+    seg = src[seg_start:seg_end]
+    check("F8 用 _open 而不是裸 urlopen", "with _open(req, timeout=60)" in seg, seg[:60].replace("\n", " "))
+    check("F8 不含 _u.urlopen", "_u.urlopen" not in seg, "还在裸直连")
+    check("F8 失败时报「参考图下载失败」", "参考图下载失败" in seg)
+
+    # 行为：_open 抛异常 ⇒ RuntimeError 且信息可读
+    real_open = ybp._open
+
+    class Boom(Exception):
+        pass
+
+    def bad_open(req, timeout=300):
+        raise Boom("connection reset by peer")
+
+    try:
+        ybp._open = bad_open
+        try:
+            ybp._ref_to_data_uri("https://example.com/a.png")
+            check("F8 下载失败应抛错", False, "没有抛异常")
+        except RuntimeError as e:
+            check("F8 下载失败 → RuntimeError", True)
+            check("F8 错误信息含原因", "connection reset" in str(e), str(e)[:90])
+            check("F8 错误信息含 URL", "example.com" in str(e), str(e)[:90])
+        except Exception as e:
+            check("F8 下载失败 → RuntimeError", False, type(e).__name__)
+
+        # 正常：_open 返回可读对象 ⇒ 转 dataURI
+        class Shim:
+            status = 200
+            headers = {"content-type": "image/png"}
+            def read(self):
+                return b"\x89PNG\r\n\x1a\nDATA"
+            def __enter__(self):
+                return self
+            def __exit__(self, *a):
+                return False
+
+        ybp._open = lambda req, timeout=300: Shim()
+        uri = ybp._ref_to_data_uri("https://example.com/a.png")
+        check("F8 正常转 dataURI", uri.startswith("data:image/png;base64,"), uri[:40])
+        # dataURI / 裸 base64 原样
+        check("F8 dataURI 直通", ybp._ref_to_data_uri("data:image/png;base64,AAA") == "data:image/png;base64,AAA")
+        check("F8 裸 base64 包装", ybp._ref_to_data_uri("QUJD").startswith("data:image/png;base64,QUJD"))
+    finally:
+        ybp._open = real_open
+
+    # pool_router 必须把上游 5xx 的 body 带出来
+    check("F8 轮询带出上游 body", 'last_err = "上游 %s 返回 %d：%s"' in src)
+    check("F8 轮询打日志便于排查", 'print("[router] %s" % last_err' in src)
+
+
 if __name__ == "__main__":
-    f1(); f2(); f3(); f4(); f5(); f6(); f7()
+    f1(); f2(); f3(); f4(); f5(); f6(); f7(); f8()
     print()
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), FAILS))

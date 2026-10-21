@@ -1502,18 +1502,27 @@ def fold_messages(messages: list) -> tuple:
 
 
 def _ref_to_data_uri(ref: str) -> str:
-    """image ref → data URI（支持 URL / data URI / 裸 base64）。"""
+    """image ref → data URI（支持 URL / data URI / 裸 base64）。
+
+    🔴 URL 必须走 `_open`（本号固定出口），**不要裸 urlopen 直连**：
+       实测过一次"URL 本身 200、容器直连却拿不到"⇒ 生图 502，且错误信息毫无指向性。
+       业务请求走哪个出口，取参考图就该走哪个出口。
+    """
     if ref.startswith("data:"):
         return ref
     if ref.startswith("http://") or ref.startswith("https://"):
         import base64 as _b64
-        import urllib.request as _u
-        req = _u.Request(ref, headers={"user-agent": "Mozilla/5.0"})
-        with _u.urlopen(req, timeout=60) as resp:
-            blob = resp.read()
-            mime = resp.headers.get("content-type", "image/png").split(";")[0].strip()
-            if not mime.startswith("image/"):
-                mime = "image/png"
+        req = _ureq.Request(ref, headers={"user-agent": "Mozilla/5.0"})
+        try:
+            with _open(req, timeout=60) as resp:
+                blob = resp.read()
+                mime = (resp.headers.get("content-type") or "image/png").split(";")[0].strip()
+        except Exception as e:
+            raise RuntimeError("参考图下载失败（%s）：%s" % (ref[:90], str(e)[:120]))
+        if not blob:
+            raise RuntimeError("参考图下载为空：%s" % ref[:90])
+        if not mime.startswith("image/"):
+            mime = "image/png"
         return f"data:{mime};base64,{_b64.b64encode(blob).decode()}"
     return f"data:image/png;base64,{ref}"
 
@@ -3417,7 +3426,15 @@ async def pool_router(req: Request, rest: str):
             last_err = "%s: %s" % (type(e).__name__, str(e)[:120])
             continue
         if up.status_code >= 500:
-            last_err = "上游 %s 返回 %d" % (t.get("name"), up.status_code)
+            # 🔴 一定要把上游 body 带出来：否则 502 的真实原因（参考图下载失败 / 封号 / 过期）
+            #    会在轮询层被压成一句"号池轮询全部失败"，排查时毫无线索。
+            _body = ""
+            try:
+                _body = next(up.iter_content(4096), b"").decode("utf-8", "replace")
+            except Exception:
+                pass
+            last_err = "上游 %s 返回 %d：%s" % (t.get("name"), up.status_code, _body[:220])
+            print("[router] %s" % last_err, flush=True)
             try:
                 up.close()
             except Exception:
@@ -5354,7 +5371,7 @@ async def _images_core(req: Request, body: dict, image_refs_in=None):
                     )
     except Exception as e:
         _note_ban(e) or _note_expired(e)
-        return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
+        return JSONResponse({"error": {"message": f"生图失败: {e}", "type": "api_error"}}, status_code=502)
 
     # 用完即删（浏览器模式）：历史零残留
     if conv_created:

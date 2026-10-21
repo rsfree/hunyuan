@@ -192,12 +192,12 @@ def _client():
 
 
 def _patch_downstream(seen):
-    """mock 下游：记录 image_refs，返回一个合法的 result。"""
+    """mock 下游：记录 image_refs / force_image，返回一个合法的 result。"""
     real = ybp._cookie_mode_run
 
     def fake(cookie, agent, prompt, chat_model, image_refs, resolution, ratio=None, force_image=False):
         seen.append({"prompt": prompt, "refs": list(image_refs), "resolution": resolution,
-                     "model": chat_model, "cookie": cookie[:20]})
+                     "model": chat_model, "cookie": cookie[:20], "force_image": force_image})
         return {"status": 200, "urls": ["https://cdn.example.com/out_h0_.png"],
                 "wmUrls": ["https://cdn.example.com/out_h1_.png"], "text": "", "error": None, "raw": None}
     ybp._cookie_mode_run = fake
@@ -303,8 +303,39 @@ def e7():
           'up.headers.get("X-YB-Upscale")' not in src, "说明还是单点透传，新头会漏")
 
 
+def e8():
+    print("[E8] 文生图必须 force_image（否则退化成纯文本 → 未获取到图片）")
+    real_run, real_auth = ybp._cookie_mode_run, ybp._check_auth
+    seen = []
+    try:
+        ybp._check_auth = lambda req: ("cookie", "hy_user=x; hy_token=y")
+        ybp._want_pool_route = lambda req: False
+        real_cm = _patch_downstream(seen)
+        ybp.YB_UPSCALE_ENABLE = False
+        c = _client()
+
+        # 无参考图 = 文生图 ⇒ force_image 必须 True
+        r = c.post("/v1/images/generations",
+                   json={"model": "hy-image-3.5", "prompt": "一只柯基", "size": "2048x2048"})
+        check("E8 文生图 http=200", r.status_code == 200, r.status_code)
+        check("E8 文生图 force_image=True", seen and seen[0].get("force_image") is True,
+              seen[0].get("force_image") if seen else None)
+        check("E8 文生图无参考图", seen and seen[0]["refs"] == [], seen[0]["refs"] if seen else None)
+
+        # 有参考图 = 图生图 ⇒ force_image False（走 i2i 分支即可）
+        seen[:] = []
+        r = c.post("/v1/images/generations",
+                   json={"model": "hy-image-3.5", "prompt": "改背景",
+                         "image": "data:image/png;base64,QUJD", "size": "2048x2048"})
+        check("E8 图生图 http=200", r.status_code == 200, r.status_code)
+        check("E8 图生图 force_image=False", seen and seen[0].get("force_image") is False,
+              seen[0].get("force_image") if seen else None)
+    finally:
+        ybp._cookie_mode_run, ybp._check_auth = real_run, real_auth
+
+
 if __name__ == "__main__":
-    e1(); e2(); e3(); e4(); e5(); e6(); e7()
+    e1(); e2(); e3(); e4(); e5(); e6(); e7(); e8()
     print()
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), FAILS))

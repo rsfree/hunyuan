@@ -5322,9 +5322,14 @@ async def _images_core(req: Request, body: dict, image_refs_in=None):
     conv_created = None
     try:
         if cookie_str:
+            # 🔴 必须显式 force_image：`_cookie_mode_run` 内部是
+            #    `if image_refs or force_image:` 才走生图管道，否则退化成**纯文本聊天**
+            #    ⇒ 文生图（无参考图）会拿到一段文字，然后报「未获取到图片: None」。
+            #    chat 门早就传了，images 端点一直漏传，属长期隐性 bug。
             result = _cookie_mode_run(cookie_str, (("naQivTmsDa" if YB_MINT_BACKEND == "cdp" else _ensure_page()["agentId"])), prompt,
                                       chat_model, image_refs, resolution,
-                                      _size_to_ratio(body.get("size", "")))
+                                      _size_to_ratio(body.get("size", "")),
+                                      force_image=not image_refs)
 
         else:
             # 浏览器模式：执行器 = bsk（本机）| cdp（服务器 headless Chromium）

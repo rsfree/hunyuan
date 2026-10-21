@@ -16,7 +16,7 @@ FAILS = []
 
 
 def check(name, cond, detail=""):
-    print("  %s %s%s" % ("PASS" if cond else "FAIL", name, ("  " + detail) if detail else ""))
+    print("  %s %s%s" % ("PASS" if cond else "FAIL", name, ("  " + str(detail)) if detail != "" else ""))
     if not cond:
         FAILS.append(name)
 
@@ -36,20 +36,25 @@ def g1():
 
 
 def g2():
-    print("[G2] 每日配额")
+    print("[G2] 每日配额（**只约束生成类**，聊天不受限）")
     g = guard.Guard(warmup_days=0, daily_quota=3)
     check("G2 初始 0", g.used() == 0)
-    g.note(); g.note()
-    check("G2 用 2 次仍放行", g.check("chat") is None and g.used() == 2)
-    g.note()
-    r = g.check("chat")
+    g.note("image"); g.note("image")
+    check("G2 用 2 次仍放行", g.check("image") is None and g.used() == 2)
+    g.note("image")
+    r = g.check("image")
     check("G2 用满 3 次 ⇒ 429", r is not None and r["status"] == 429, str(r and r["status"]))
     check("G2 错误码正确", r and r["error"]["code"] == "daily_quota_exceeded")
-    check("G2 生图同样被挡", g.check("image")["status"] == 429)
+    # 🔴 曾经的 bug：quota 把聊天也算进去 ⇒ 配额用尽后连聊天都 429（养号期没法养号）
+    check("G2 配额用尽后聊天仍放行", g.check("chat") is None, "聊天被配额锁死了")
     g2b = guard.Guard(daily_quota=0)
     for _ in range(50):
-        g2b.note()
+        g2b.note("image")
     check("G2 quota=0 ⇒ 不限", g2b.check("image") is None)
+    g2c = guard.Guard(daily_quota=2)
+    for _ in range(50):
+        g2c.note("chat")
+    check("G2 只记聊天不占配额", g2c.used() == 0 and g2c.check("image") is None, g2c.used())
 
 
 def g3():
@@ -66,7 +71,7 @@ def g3():
 def g4():
     print("[G4] snapshot")
     g = guard.Guard(warmup_days=3, daily_quota=10, age_days=lambda: 1.234)
-    g.note()
+    g.note("image")
     s = g.snapshot()
     check("G4 字段齐全", all(k in s for k in ("warmup_days", "daily_quota", "used_today", "account_age_days")))
     check("G4 数值正确", s["used_today"] == 1 and s["account_age_days"] == 1.23, str(s))
@@ -85,7 +90,7 @@ def g5():
     for i, ln in enumerate(lines, 1):
         if "image_flow = bool(" in ln:
             pos.setdefault("image_flow", i)
-        if 'GUARD.check("image" if (image_flow' in ln:
+        if 'GUARD.check(_gk)' in ln or 'GUARD.check("image" if (image_flow' in ln:
             pos.setdefault("guard", i)
         if ln.strip() == "created = int(time.time())":
             pos.setdefault("created", i)
@@ -98,10 +103,49 @@ def g5():
     check("G5 找到真流式分支", stream_line is not None, str(stream_line))
     check("G5 guard 先于真流式分支", pos.get("guard", 10**9) < (stream_line or -1),
           "guard=%s stream=%s" % (pos.get("guard"), stream_line))
+    # 配额只卡生成类 ⇒ check/note 必须带上 image_flow 推出的 kind，而不是恒定 "chat"
+    check("G5 kind 由 image_flow 决定", '_gk = "image" if (image_flow' in src)
+    check("G5 note 透传 kind", "GUARD.note(_gk)" in src)
+
+
+def g6():
+    """配额语义：只卡生成类，聊天永远放行。
+
+    真实事故：`note()` 无条件计数 + quota 判定不区分 kind ⇒
+    设 YB_DAILY_QUOTA 后，第 N 次**任何**调用（含聊天）都被 429，
+    与"养号期靠纯文本聊天养号"的设计直接矛盾。
+    """
+    print("[G6] 日配额只卡生成类")
+    G = guard.Guard(warmup_days=0, daily_quota=2)
+    real_q, real_c = G.daily_quota, G._count
+    try:
+        G.daily_quota, G._count = 2, 0
+        seq = []
+        for _ in range(4):
+            r = G.check("image")
+            seq.append("拒绝" if r else "放行")
+            if not r:
+                G.note("image")
+        check("G6 生成类前 2 次放行", seq[:2] == ["放行", "放行"], str(seq))
+        check("G6 生成类第 3/4 次拒绝", seq[2:] == ["拒绝", "拒绝"], str(seq))
+        check("G6 配额用尽后聊天仍放行", G.check("chat") is None, "聊天被配额锁死了")
+
+        # note 只对 image 计数
+        G.daily_quota, G._count = 0, 0
+        for _ in range(5):
+            G.note("chat")
+        check("G6 连记 5 次聊天 → 计数不变", G._count == 0, G._count)
+        for _ in range(3):
+            G.note("image")
+        check("G6 记 3 次生图 → 计数 = 3", G._count == 3, G._count)
+        check("G6 note() 缺省不计数（向后兼容老调用点）",
+              (G.note() or 0) == 3, G._count)
+    finally:
+        G.daily_quota, G._count = real_q, real_c
 
 
 if __name__ == "__main__":
-    g1(); g2(); g3(); g4(); g5()
+    g1(); g2(); g3(); g4(); g5(); g6()
     print("\n%s  %d 项失败" % ("❌" if FAILS else "✅ 全部通过", len(FAILS)))
     for f in FAILS:
         print("   -", f)

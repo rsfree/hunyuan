@@ -4821,11 +4821,12 @@ async def chat_completions(req: Request):
     image_flow = bool(image_refs) or (_is_image_model(model_in) and not unwm)
 
     # ---- 护栏：养号期禁生图 / 每日配额（必须放在 image_flow 之后；放前面会 UnboundLocalError）----
-    _g = GUARD.check("image" if (image_flow or unwm) else "chat")
+    _gk = "image" if (image_flow or unwm) else "chat"
+    _g = GUARD.check(_gk)
     if _g:
         print("[guard] 拒绝 %s: %s" % (_g["error"].get("code"), _g["error"].get("message", "")[:80]), flush=True)
         return JSONResponse(_g["error"], status_code=_g["status"])
-    GUARD.note()
+    GUARD.note(_gk)
 
     # ---- 真流式优先：透传模式 · 纯文本聊天（边收元宝 SSE 边转发，首字节 ~1s）----
     if stream and cookie_str and not image_flow and not unwm:
@@ -5331,7 +5332,7 @@ async def _images_core(req: Request, body: dict, image_refs_in=None):
     if _g:
         print("[guard] 拒绝生图: %s" % _g["error"].get("code"), flush=True)
         return JSONResponse(_g["error"], status_code=_g["status"])
-    GUARD.note()
+    GUARD.note("image")
 
     created = int(time.time())
     conv_created = None

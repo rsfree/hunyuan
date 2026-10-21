@@ -38,9 +38,17 @@ class Guard:
         self._roll()
         return self._count
 
-    def note(self) -> int:
+    def note(self, kind: str = "chat") -> int:
+        """计数。**只对生成类（image）计数**。
+
+        🔴 配额语义是"每实例每天最多 N 次生成"，不是"最多 N 次调用"。
+           早先实现无条件 `_count += 1`，导致聊天也吃配额 ——
+           养号期天天聊天的号会被自己的配额锁死（实测 check("chat") 在
+           quota 用尽后被拒，与"只禁生图"的设计直接矛盾）。
+        """
         self._roll()
-        self._count += 1
+        if kind == "image":
+            self._count += 1
         return self._count
 
     # ---------- 判定 ----------
@@ -61,7 +69,8 @@ class Guard:
                                          % (age, self.warmup_days),
                               "type": "api_error", "code": "warmup_image_blocked"},
                 }
-        if self.daily_quota > 0 and self._count >= self.daily_quota:
+        # 配额只约束生成类；聊天永远不受日配额影响（否则养号期没法养号）
+        if kind == "image" and self.daily_quota > 0 and self._count >= self.daily_quota:
             return {
                 "status": 429,
                 "error": {"message": "本实例今日配额已用尽（%d/%d）。这是主动限频，用于降低封号风险；"

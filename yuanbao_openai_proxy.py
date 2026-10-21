@@ -5175,6 +5175,33 @@ def _size_to_target_box(size: str) -> Optional[tuple]:
     return (w, h)
 
 
+_CUT_TOL = 0.02        # 请求比例与上游槽位比例的允许偏差（超过就不裁，宁可尺寸略大）
+
+
+def _exact_cut_ok(size: str) -> bool:
+    """请求尺寸能否安全裁成「精确像素」。
+
+    能裁的前提是上游给出的比例与请求比例足够接近：
+    `_size_to_ratio()` 已把任意 WxH 映射到最近的槽位，所以两者最多差一点
+    （实测上游 16:9 出的是 2240x1248 = 1.7949，比 16/9 宽 0.96%）。
+    差距大时（如客户要 21:9、上游只能给 16:9）cover 后硬裁会削掉画面主体，
+    此时保留 cover 结果并把差异写进 `upscale.info`，不假装拿到了精确尺寸。
+    """
+    import math
+    if not size:
+        return False
+    m = re.match(r"^(\d{2,4})x(\d{2,4})$", size.strip().lower())
+    if not m:
+        return False
+    w, h = int(m.group(1)), int(m.group(2))
+    if w <= 0 or h <= 0:
+        return False
+    slot = _size_to_ratio(size)
+    if slot not in _RATIO_SLOTS:
+        return False
+    return abs(math.log((w / h) / _RATIO_SLOTS[slot])) <= math.log(1 + _CUT_TOL)
+
+
 def _ci_join(url: str, op: str) -> str:
     """把 CI 算符拼到 URL 上（已有 query 用 &，否则用 ?）。"""
     sep = "&" if ("?" in url) else "?"
@@ -5244,17 +5271,26 @@ def _maybe_upscale(urls: list, size: str) -> tuple:
     box = _size_to_target_box(size) if YB_UPSCALE_ENABLE else None
     if not box or not urls:
         return urls, None
+    exact = _exact_cut_ok(size)
     out, applied = [], 0
     for u in urls:
         if _ci_supported(u):
-            out.append(_ci_join(u, "imageMogr2/thumbnail/!%dx%dr" % box))
+            op = "imageMogr2/thumbnail/!%dx%dr" % box
+            if exact:
+                # `|` 是腾讯 CI 的链式分隔符。写成 `thumbnail/!WxHr/cut/WxH`（用 `/`）
+                # 会被整体忽略并静默返回原图 —— 2026-10-22 实测确认。
+                op += "|imageMogr2/gravity/center/cut/%dx%d" % box
+            out.append(_ci_join(u, op))
             applied += 1
         else:
             out.append(u)
     info = {"requested": size, "box": "%dx%d" % box,
-            "upscaled": applied, "total": len(urls),
-            "note": "图床等比插值放大（非 AI 超分）；不支持 CI 的图床原样返回"}
-    print("[upscale] %s → %dx%d：%d/%d 张已放大" % (size, box[0], box[1], applied, len(urls)), flush=True)
+            "upscaled": applied, "total": len(urls), "exact": exact,
+            "note": "图床等比插值放大（非 AI 超分）；不支持 CI 的图床原样返回"
+                    + ("" if exact else "；请求比例与上游能力差 >2%，尺寸为 cover 结果、可能略大于请求值")}
+    print("[upscale] %s → %dx%d（%s）：%d/%d 张已放大"
+          % (size, box[0], box[1], "精确裁切" if exact else "cover 保留原比例", applied, len(urls)),
+          flush=True)
     return out, info
 
 

@@ -72,7 +72,10 @@ YB_STATE_DIR = os.environ.get("YB_STATE_DIR", "/data/state")
 YB_AUTO_DISABLE_AFTER = int(os.environ.get("YB_AUTO_DISABLE_AFTER", "3"))       # 连续保活失败几次→自动隔离
 YB_AUTO_REENABLE_AFTER = int(os.environ.get("YB_AUTO_REENABLE_AFTER", "1"))     # 连续成功几次→自动恢复（0=不自动恢复）
 YB_AUTO_EJECT_AFTER_DAYS = int(os.environ.get("YB_AUTO_EJECT_AFTER_DAYS", "0")) # 隔离超几天→自动剔除（0=关闭）
-YB_ROUTER = os.environ.get("YB_ROUTER", "1") == "1"                            # 是否开放 /pool/v1 轮询入口
+YB_ROUTER = os.environ.get("YB_ROUTER", "1") == "1"                            # /v1 是否走号池轮询（0=只直连本实例）
+# 轮询的"健康新鲜度"窗口（秒）：last_health 超过这么久就认为不可信、不进轮询。
+# 保活周期默认 900s ⇒ 1800s 给两次机会；设 0 关闭该检查。
+YB_ROUTER_HEALTH_TTL = int(os.environ.get("YB_ROUTER_HEALTH_TTL", "1800"))
 # 构建版本（由 update-service.sh 注入 git describe，便于确认"线上跑的是哪个版本"）
 YB_BUILD_VERSION = os.environ.get("YB_BUILD_VERSION", "unknown")
 _WATERMARK: dict = {"at": 0, "ok": None, "enabled": None, "detail": "", "attempts": 0}
@@ -2728,16 +2731,32 @@ def _peer_state_cached(url: str, ttl: int = 8):
 
 
 def _router_ok(st: dict) -> bool:
-    """路由门禁：**必须 enabled 且最近一次保活成功**。
+    """路由门禁：**只放行"有效"账号**，四个条件缺一不可。
 
-    只判 routable 是不够的 —— 刚 add-account 出来、还没扫码登录的实例也是 enabled，
-    但把它算进轮询只会把用户请求打到一个用不了的号上。所以要求"健康被证实过"。
-    新号登录后 /admin/state 会立刻触发一次保活（见下），约 20s 内即可参与轮询。
+    1. `state == enabled`（routable）—— disabled/quarantined/ejected 一律不参与
+    2. `last_health.ok is True` —— 刚 add 出来、从没成功过的号不能进（会白打）
+    3. `last_health.frozen` 为假 —— 页内显示"已冻结"的号立刻排除，不等状态机
+    4. **健康新鲜度** —— `last_health.at` 距今不超过 `YB_ROUTER_HEALTH_TTL`
+       （几小时前的"曾成功"不代表现在还能用；保活停摆后应自动退出轮询）
+
+    ⚠️ 单看 routable/enabled 是不够的：cookie 残留但已 23000 过期的号
+       在服务端看来仍是"登录中"，只有真发一次请求才知道 —— 这正是健康新鲜度的意义。
     """
     if not st or not st.get("routable"):
         return False
     h = st.get("last_health") or {}
-    return h.get("ok") is True
+    if h.get("ok") is not True:
+        return False
+    if h.get("frozen"):
+        return False
+    if YB_ROUTER_HEALTH_TTL > 0:
+        try:
+            at = int(h.get("at") or 0)
+        except Exception:
+            at = 0
+        if at > 0 and (time.time() - at) > YB_ROUTER_HEALTH_TTL:
+            return False
+    return True
 
 
 def _self_usable() -> bool:
@@ -2829,7 +2848,7 @@ def _want_pool_route(req: Request) -> bool:
     """`POST /v1/*` 是否应该走号池轮询（而不是本实例直连）。
 
     判定只看两件事：
-      1. `X-YB-Direct: 1` —— 内部转发标记，强制直连（否则 /v1 ⇄ /pool/v1 无限递归）
+      1. `X-YB-Direct: 1` —— 内部转发标记，强制直连（否则轮询转发回 /v1 会无限递归）
       2. Bearer 是不是 **cookie 串** —— 是则用调用方自己的号直连，不抢池里的号
 
     剩下的情况（实例 key / 无门禁）一律轮询：用户配一个地址就该能用全部号。
@@ -3128,7 +3147,7 @@ async def admin_group_bulk(req: Request):
 
     print("[bulk] 导入 %d 条，成功 %d（dry=%s）" % (len(items), added, dry), flush=True)
     return {"result": {"total": len(items), "added": added, "results": results},
-            "hint": "组内账号**只在本实例可见** —— 要让 /pool/v1 用到，必须加在公网入口实例（acc01）上"}
+            "hint": "组内账号**只在本实例可见** —— 要让 /v1 轮询用到，必须加在公网入口实例（acc01）上"}
 
 
 @app.post("/admin/group")
@@ -3274,7 +3293,7 @@ async def admin_accounts(req: Request):
                 and (((x.get("state") or {}).get("last_health") or {}).get("ok") is True or False)]
     return {"accounts": res, "routable": len(routable), "total": len(res),
             "build_version": YB_BUILD_VERSION,
-            "router_enabled": YB_ROUTER, "router_entry": "/pool/v1",
+            "router_enabled": YB_ROUTER, "router_entry": "/v1（默认走号池轮询）",
             "auto": {"disable_after": YB_AUTO_DISABLE_AFTER,
                      "reenable_after": YB_AUTO_REENABLE_AFTER,
                      "eject_after_days": YB_AUTO_EJECT_AFTER_DAYS},
@@ -3357,14 +3376,14 @@ async def pool_peer_proxy(req: Request, name: str, path: str):
                              headers={"X-YB-Peer": name})
 
 
-@app.api_route("/pool/v1/{rest:path}", methods=["GET", "POST"])
 async def pool_router(req: Request, rest: str):
-    """**轮询入口**：/pool/v1/<rest> 轮询分发到各可用账号，失败自动切下一个。
+    """**号池轮询的内部实现** —— 由 `/v1/*` 分流进来调用，**不再单独暴露地址**。
 
-    与直连入口的分工：
-      /v1/*       → 只用本实例自己的账号（直连，行为不变）
-      /pool/v1/*  → 在整个号池里轮询（本接口；调用方只认一个 key）
-    仅 state=enabled 的账号参与；遇到 5xx/连接错误自动 failover 到下一个。
+    `/v1/chat/completions` / `/v1/images/generations` / `/v1/images/edits` 在入口处
+    用 `_want_pool_route()` 判定（Bearer = 实例 key 就轮询），然后调本函数。
+
+    只有 `_router_ok()` 认可的**有效账号**参与（enabled + 保活成功 + 未冻结 + 健康新鲜）；
+    遇到 5xx / 连接错误自动 failover 到下一个，最多试 3 个。
     """
     cred = _check_auth(req)
     if isinstance(cred, JSONResponse):

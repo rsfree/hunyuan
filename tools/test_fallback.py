@@ -220,8 +220,73 @@ def f5():
     check("F5 pool_router 打 X-YB-Direct", '"X-YB-Direct": "1"' in src)
 
 
+def f6():
+    print("[F6] _router_ok：只放行「有效账号」四条件")
+    tmp = tempfile.mkdtemp()
+    real_ttl = ybp.YB_ROUTER_HEALTH_TTL
+    try:
+        def mk(name, state="enabled", ok=True, frozen=False, age=0):
+            acc = pool_state.AccountState(os.path.join(tmp, name + ".json"), name, 3, 1, 0)
+            acc.record_health(ok, 200 if ok else 500, "alive" if ok else "boom", frozen, False)
+            if age and acc.get().get("last_health"):
+                acc._d["last_health"]["at"] -= age      # 人为做旧
+                acc._save()
+            if state != "enabled":
+                acc.apply(state if state != "quarantined" else "quarantine", "t", by="auto")
+            return acc.get()
+
+        ybp.YB_ROUTER_HEALTH_TTL = 1800
+        check("F6 enabled+ok+新鲜 ⇒ 放行", ybp._router_ok(mk("a1")) is True)
+        check("F6 从未成功 ⇒ 拒绝", ybp._router_ok(mk("a2", ok=False)) is False)
+
+        st = mk("a3")
+        st["state"] = "disabled"; st["routable"] = False
+        check("F6 disabled ⇒ 拒绝", ybp._router_ok(st) is False)
+
+        st = mk("a4", frozen=True)
+        check("F6 frozen ⇒ 拒绝", ybp._router_ok(st) is False, str(st.get("last_health"))[:70])
+
+        st = mk("a5")
+        st["last_health"]["ok"] = None
+        check("F6 ok=None（未知）⇒ 拒绝", ybp._router_ok(st) is False)
+
+        # 健康新鲜度
+        st = mk("a6", age=3600)      # 1 小时前成功过
+        check("F6 健康过期(3600s>1800s) ⇒ 拒绝", ybp._router_ok(st) is False,
+              "at=%s" % (st.get("last_health") or {}).get("at"))
+        ybp.YB_ROUTER_HEALTH_TTL = 0
+        check("F6 TTL=0 关闭新鲜度检查 ⇒ 放行", ybp._router_ok(st) is True)
+        ybp.YB_ROUTER_HEALTH_TTL = 7200
+        check("F6 TTL 放宽到 7200 ⇒ 放行", ybp._router_ok(st) is True)
+
+        # at 缺失的老数据不该被误杀
+        st = mk("a7")
+        st["last_health"]["at"] = 0
+        ybp.YB_ROUTER_HEALTH_TTL = 1800
+        check("F6 at 缺失 ⇒ 不因新鲜度拒绝", ybp._router_ok(st) is True)
+    finally:
+        ybp.YB_ROUTER_HEALTH_TTL = real_ttl
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def f7():
+    print("[F7] /pool/v1 已删除，只剩 /v1")
+    from fastapi.testclient import TestClient
+    c = TestClient(ybp.app)
+    for path in ("/pool/v1/chat/completions", "/pool/v1/images/generations"):
+        r = c.post(path, json={}, headers={"Authorization": "Bearer x"})
+        check("F7 %-32s ⇒ 404" % path, r.status_code == 404, r.status_code)
+    # /v1 仍然存在（不是删过头）
+    r = c.post("/v1/chat/completions", json={}, headers={"Authorization": "Bearer hy_user=x; hy_token=y"})
+    check("F7 /v1/chat/completions 仍在", r.status_code != 404, r.status_code)
+    # 源码里不许再出现公开路由
+    src = open(os.path.join(ROOT, "yuanbao_openai_proxy.py"), encoding="utf-8").read()
+    check("F7 源码无 /pool/v1 字样", "pool/v1" not in src, "还有残留文案")
+    check("F7 pool_router 仍是普通函数", "async def pool_router(req: Request, rest: str):" in src)
+
+
 if __name__ == "__main__":
-    f1(); f2(); f3(); f4(); f5()
+    f1(); f2(); f3(); f4(); f5(); f6(); f7()
     print()
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), FAILS))

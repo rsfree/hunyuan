@@ -191,24 +191,37 @@ curl -X POST -H "Authorization: Bearer $K" -H 'content-type: application/json' \
 
 `action` ∈ `enable|disable|eject|restore|reset|note`；带 `name` 会**转发给对应实例**执行（不必逐台登）。
 
-## 八、轮询入口（号池分发）
+## 八、入口只有一个：`/v1`（默认走号池轮询）
 
 ```
-/v1/*       → 只用本实例自己的账号（直连，行为不变）
-/pool/v1/*  → 在整个号池里**轮询**分发，失败自动 failover
+POST /v1/chat/completions   → 轮询整个号池，失败自动 failover
+POST /v1/images/generations → 同上（JSON 的 image 放 URL/dataURI）
+POST /v1/images/edits       → 同上（multipart 上传参考图，OpenAI 标准）
+GET  /v1/models             → 本地静态返回
 ```
+
+> `/pool/v1/*` 已**删除**（2026-10-21）。历史调用方请把 `/pool/v1/xxx` 改成 `/v1/xxx`。
 
 ```bash
 # 调用方只认一个 key（本实例的 YUANBAO_API_KEY）
-curl https://yuanbao.example.com/pool/v1/chat/completions \
+curl https://yuanbao.example.com/v1/chat/completions \
   -H "Authorization: Bearer $K" -H 'content-type: application/json' \
   -d '{"model":"hunyuan","messages":[{"role":"user","content":"hi"}]}'
 # 响应头 X-YB-Routed-To: acc01  ← 本次落到哪个号
 ```
 
-- 只有 `state=enabled` 的账号参与轮询；遇 5xx / 连接错误自动换下一个（最多试 3 个）
+**什么时候不轮询**：
+
+| 条件 | 行为 |
+|---|---|
+| Bearer 是 cookie 串 | 用调用方自己的号直连（诊断/临时用） |
+| `X-YB-Direct: 1` | 强制直连（内部转发用，防递归） |
+| 池内无有效账号 | 回落本实例直连（不直接 503，错误信息更具体） |
+| `YB_ROUTER=0` | 全部直连本实例 |
+
+- 只有**有效账号**参与轮询（见第十二节门禁）
+- 遇 5xx / 连接错误自动换下一个（最多试 3 个）
 - 全部不可用 → `503`，message 里带已尝试的账号
-- 关闭入口：`YB_ROUTER=0`
 - ⚠️ 跨实例转发需要**目标实例的 API key**，写在 peer 配置里：`name=url|key`
 
 ## 九、调用统计（账号 × 模型）
@@ -282,7 +295,16 @@ curl -H "Authorization: Bearer <key>" https://yuanbao.example.com/pool/peer/acc0
 
 ## 十二、路由健康门禁与新号冷启动
 
-**门禁**：`/pool/v1/*` 只会把请求发给 **`state=enabled` 且最近一次保活成功** 的实例。
+**门禁**：轮询只会把请求发给**有效账号**，四个条件缺一不可：
+
+1. `state == enabled`（`disabled` / `quarantined` / `ejected` 一律不参与）
+2. `last_health.ok == true`（从没成功过的号不进 —— 否则白打一次）
+3. `last_health.frozen` 为假（页内已显示"账号已冻结"的立刻排除）
+4. **健康新鲜度**：`last_health.at` 距今 ≤ `YB_ROUTER_HEALTH_TTL`（默认 1800s，设 0 关闭）
+
+> 第 4 条是必须的：`enabled` + 历史成功**不能**证明"现在可用"。
+> 实测 cookie 残留但已被服务端判 `23000 登录已过期` 的号，在状态机里仍是 `enabled`；
+> 而且保活走的 `/api/info/general` 对过期号**照样返回 200**。健康新鲜度 + 真请求才是唯一判据。
 
 只判 `enabled` 是不够的 —— 刚 `add-account` 出来还没扫码登录的实例也是 `enabled`，
 把它算进轮询只会把请求打到一个用不了的号上。

@@ -2740,6 +2740,48 @@ def _router_ok(st: dict) -> bool:
     return h.get("ok") is True
 
 
+def _self_usable() -> bool:
+    """本实例自带浏览器账号当前是否可路由（enabled + 最近一次保活成功）。
+
+    ACCOUNT 为 None（老部署/未初始化状态机）时返回 True —— 保持原行为，不擅自兜底。
+    """
+    if ACCOUNT is None:
+        return True
+    try:
+        return _router_ok(ACCOUNT.get())
+    except Exception:
+        return True
+
+
+def _fallback_cookie() -> str:
+    """页面模式兜底：本实例浏览器账号不可用 → 改用组内健康的 cookie 账号。
+
+    🔴 为什么需要（2026-10-21 公网实测）：实例浏览器号一被封（20004）或掉登录（23000），
+       用实例 key 直连 `/v1/*` 会**全部 502** —— 页内数据面只能用它自己那一个浏览器，
+       账号死了整个实例的直连接口就全废，哪怕组里还有健康的 cookie 账号。
+       cookie 账号是纯 HTTP，与浏览器状态无关，正好当兜底。
+    只在 `_self_usable()` 为 False 时才兜底：健康时继续用页面模式（签名更"真实"）。
+    """
+    if COOKIE_ACCOUNTS is None or _self_usable():
+        return ""
+    best = None
+    for a in COOKIE_ACCOUNTS.list():
+        st = a.get("state") or {}
+        if not _router_ok(st):
+            continue
+        ck = COOKIE_ACCOUNTS.cookie(a["name"])
+        if not ck:
+            continue
+        at = int((st.get("last_health") or {}).get("at") or 0)
+        if best is None or at >= best[0]:        # 取最近一次健康时间最新的
+            best = (at, a["name"], ck)
+    if best:
+        print("[fallback] 本实例账号不可用（%s）→ 改用组内账号 %s"
+              % ((ACCOUNT.get().get("state") if ACCOUNT else "?"), best[1]), flush=True)
+        return best[2]
+    return ""
+
+
 def _router_targets():
     """可参与轮询的：本组 cookie 账号 + 自己 + 各 peer（严格按 _router_ok 判定）。
 
@@ -2781,6 +2823,37 @@ def _router_pick():
         t = ts[_ROT_IDX % len(ts)]
         _ROT_IDX += 1
     return t
+
+
+def _want_pool_route(req: Request) -> bool:
+    """`POST /v1/*` 是否应该走号池轮询（而不是本实例直连）。
+
+    判定只看两件事：
+      1. `X-YB-Direct: 1` —— 内部转发标记，强制直连（否则 /v1 ⇄ /pool/v1 无限递归）
+      2. Bearer 是不是 **cookie 串** —— 是则用调用方自己的号直连，不抢池里的号
+
+    剩下的情况（实例 key / 无门禁）一律轮询：用户配一个地址就该能用全部号。
+    """
+    if req.headers.get("x-yb-direct"):
+        return False
+    if not YB_ROUTER:
+        return False
+    try:
+        cred = _check_auth(req)
+    except Exception:
+        return False
+    if isinstance(cred, JSONResponse):
+        return False            # 鉴权失败交给原逻辑返回 401
+    if isinstance(cred, tuple):
+        return False            # tuple = cookie 透传 ⇒ 用调用方自己的号直连
+    # 🔴 池内真的要有可用目标才轮询：否则回落直连，让原有页面模式跑出真实错误。
+    #    这条保证「单实例裸部署 / 刚启动还没保活」时 /v1 仍然可用（否则会突然全 503）。
+    try:
+        if not _router_targets():
+            return False
+    except Exception:
+        return False
+    return True
 
 
 @app.get("/admin/account")
@@ -3311,7 +3384,9 @@ async def pool_router(req: Request, rest: str):
             break
         tried.append(t.get("name"))
         url = t["url"].rstrip("/") + "/v1/" + rest
-        hdr = {"content-type": req.headers.get("content-type", "application/json")}
+        hdr = {"content-type": req.headers.get("content-type", "application/json"),
+               # 🔴 内部标记：目标实例的 /v1 看到它就必须**直连**，否则会再次轮询 → 无限递归
+               "X-YB-Direct": "1"}
         tkey = t.get("key") or ""
         if tkey:
             hdr["Authorization"] = "Bearer " + tkey
@@ -3342,9 +3417,13 @@ async def pool_router(req: Request, rest: str):
                     pass
 
         # 同步生成器：Starlette 会自动放到线程池迭代，不会阻塞事件循环
+        _oh = {"X-YB-Routed-To": str(t.get("name"))}
+        _up_hdr = up.headers.get("X-YB-Upscale") or up.headers.get("x-yb-upscale")
+        if _up_hdr:
+            _oh["X-YB-Upscale"] = _up_hdr      # 让客户端经轮询入口也能看到放大结果
         return StreamingResponse(gen(), status_code=up.status_code,
                                  media_type=up.headers.get("content-type", "application/json"),
-                                 headers={"X-YB-Routed-To": str(t.get("name"))})
+                                 headers=_oh)
     return JSONResponse({"error": {"message": "号池轮询全部失败：%s（已尝试 %s）" % (last_err, tried),
                                    "type": "api_error"}}, status_code=503)
 
@@ -4659,6 +4738,9 @@ async def list_models(req: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(req: Request):
+    # 统一入口：实例 key ⇒ 走号池轮询（cookie 串 / 内部转发 ⇒ 直连本实例）
+    if _want_pool_route(req):
+        return await pool_router(req, "chat/completions")
     cred = _check_auth(req)
     if isinstance(cred, JSONResponse):
         return cred
@@ -4668,6 +4750,9 @@ async def chat_completions(req: Request):
             cookie_str = open(YB_COOKIE_FILE).read().strip() or None
         except Exception:
             pass
+    # 兜底：本实例浏览器号已封/掉登录时，改用组内健康的 cookie 账号（否则 /v1 全 502）
+    if not cookie_str:
+        cookie_str = _fallback_cookie()
     # cdp+auto：无显式 cookie → 页内数据面（需容器页面已登录）；YB_DATA_PLANE=cookie 强制出站+文件凭证
     body = await req.json()
     model_in = body.get("model", "hunyuan")
@@ -5048,6 +5133,9 @@ def _size_to_ratio(size: str) -> Optional[str]:
 
 @app.post("/v1/images/generations")
 async def images_generations(req: Request):
+    # 统一入口：实例 key ⇒ 走号池轮询（cookie 串 / 内部转发 ⇒ 直连本实例）
+    if _want_pool_route(req):
+        return await pool_router(req, "images/generations")
     cred = _check_auth(req)
     _mctx(endpoint=req.url.path)
     if isinstance(cred, JSONResponse):
@@ -5058,6 +5146,9 @@ async def images_generations(req: Request):
             cookie_str = open(YB_COOKIE_FILE).read().strip() or None
         except Exception:
             pass
+    # 兜底：本实例浏览器号已封/掉登录时，改用组内健康的 cookie 账号（否则 /v1 全 502）
+    if not cookie_str:
+        cookie_str = _fallback_cookie()
     # cdp+auto：无显式 cookie → 页内数据面（需容器页面已登录）；YB_DATA_PLANE=cookie 强制出站+文件凭证
     body = await req.json()
     prompt = (body.get("prompt") or "").strip()

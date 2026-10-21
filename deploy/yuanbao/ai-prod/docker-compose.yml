@@ -57,10 +57,24 @@ services:
       # 号池总览数据源：把**所有**实例列进来（含自己），任一实例都能看到整池
       YB_POOL_PEERS: "${YB_POOL_PEERS:-acc01=https://yuanbao.example.com}"
       # === 代理池（凭据只放 .env，绝不入库）===
-      # 数据面（聊天/生图出站）逐请求轮换出口 IP —— 2088 = 池的"每请求换 IP"端口
+      # 🔴 推荐形态：**固定单出口**（一号一个固定 IP），而不是"每请求换 IP"的池。
+      #   原因：同一 cookie 一分钟内跨 N 个 IP 是强异常特征（实测会先掉登录、再升级成封号）。
+      #   配法（set-egress.sh 自动完成）：YB_PROXY_URL == YB_BROWSER_PROXY == 本号专属粘性代理，
+      #   且 YB_PROXY_POOL **留空**（留空才会用 YB_PROXY_URL）。
+      YB_PROXY_URL: "${YB_PROXY_URL:-}"
+      # 池模式（逐请求轮换出口）：仅在需要一个号扛量时用；一号一 IP 场景请留空
       YB_PROXY_POOL: "${YB_PROXY_POOL:-}"
-      # 浏览器侧（铸签/扫码/接码登录）：经本地 socks 桥走 2089（域名哈希恒定出口，更像真人会话）
+      # 浏览器侧（铸签/扫码/接码登录）：经本地 socks 桥走出去；
+      # 与 YB_PROXY_URL 同值时 = 登录 IP == 使用 IP
       YB_BROWSER_PROXY: "${YB_BROWSER_PROXY:-}"
+      # === 节奏与配额的护栏（降低封号概率）===
+      # 同凭证两请求最小间隔 + 0~N 秒随机抖动（固定等距最像脚本）
+      YB_MIN_INTERVAL: "${YB_MIN_INTERVAL:-2}"
+      YB_MIN_JITTER: "${YB_MIN_JITTER:-1.5}"
+      # 养号期：本实例首次保活成功后的 N 天内**禁止生图**（0=关闭）。建议 3
+      YB_WARMUP_DAYS: "${YB_WARMUP_DAYS:-0}"
+      # 每实例每天最多 N 次生成类调用（0=不限）。建议 60
+      YB_DAILY_QUOTA: "${YB_DAILY_QUOTA:-0}"
     # 实例间互通（号池聚合 / 批量运维 / 跨实例代理）走这个共享网络，用容器名寻址
     networks:
       - yuanbao-net

@@ -520,10 +520,15 @@ class CDPMinter:
         return st
 
     def wechat_login_url(self) -> dict:
-        """取微信登录的**可点击授权链接**（= 二维码里编码的那个 URL），可免扫码。
+        """取微信二维码里编码的 uuid / URL（**不是**可用的免扫码登录入口，见下方实测结论）。
 
-        原理：微信 qrconnect 二维码的内容就是 `https://open.weixin.qq.com/connect/confirm?uuid=xxx`。
-        把 uuid 从 iframe 里读出来拼成链接 ⇒ 发到手机微信里点开即可授权。
+        原理：qrconnect 二维码的内容确实是 `https://open.weixin.qq.com/connect/confirm?uuid=xxx`。
+
+        🔴 实测结论（2026-10-21）：该 URL **不能**当普通链接在微信里打开。
+           抓 `connect/confirm?uuid=` 的响应，HTML 只有一个 `if (!isWeixin) { 显示"请在微信客户端打开" }`
+           分支，**没有 else** ⇒ 在微信内打开是一片空白页。
+           真正的"确认登录"是微信「扫一扫」识别二维码后接管的原生 UI，链接跳转不具备这个手势上下文。
+           ⇒ 结论：登录只能**扫码**（或手机号接码）；本接口保留 uuid 以便诊断/对齐二维码。
         """
         try:
             d = json.loads(urllib.request.urlopen(CDP_HTTP + "/json/list", timeout=8).read())
@@ -553,8 +558,9 @@ class CDPMinter:
             return {"error": "未取到 uuid（二维码可能已过期，刷新后重试）"}
         return {"uuid": uuid,
                 "url": "https://open.weixin.qq.com/connect/confirm?uuid=" + uuid,
-                "hint": "把这个链接发到手机微信里（发给「文件传输助手」最方便），在微信内置浏览器点开 → "
-                        "点「确认登录」即可，无需扫码。链接约 5 分钟内有效，过期后刷新本页重新生成。"}
+                "hint": "⚠️ 这个 URL 只是二维码里编码的文本，**不能**当普通链接在微信里点开（会是一片空白页）。"
+                        "登录请直接**用微信扫上面的二维码**；没有第二块屏幕就改用「手机」Tab 接码登录。"
+                        "二维码约 5 分钟有效，过期点「刷新二维码」。"}
 
     def screenshot(self, tab: str = None, timeout_s: int = 60, capture: bool = True):
         """登录页截图：可选先切到 wechat/phone 登录方式。整段（切页 + 截图）持同一把锁，

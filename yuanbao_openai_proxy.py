@@ -7,7 +7,7 @@ yuanbao_openai_proxy.py — 腾讯元宝 (yuanbao.tencent.com) → OpenAI API �
   - 签名三件套 (X-Uskey / X-Bus-Params-Md5 / X-Timestamp) 由页面 webpack 里的
     module28850.TE(module77004.PU) 现场铸造（Qimei SDK getUSKeySync，无法脱离页面复现）
   - 请求经页内 fetch 发出（自动携带登录 cookie），响应 SSE 全量收完后转译为 OpenAI 格式
-  - 聊天为"缓冲伪流式"：等元宝完整回答后按增量 chunk 快速回放
+  - 纯文本聊天走**真流式**：边收元宝 SSE 边转发 OpenAI 分片（首字节 ~1s）
 
 依赖：本机已装 bsk CLI 且浏览器扩展在线；pip install fastapi uvicorn
 
@@ -38,6 +38,8 @@ import uuid
 import subprocess
 import threading
 from typing import Optional
+
+import guard as _guard
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse, Response
@@ -83,6 +85,8 @@ YB_MINT_BACKEND = os.environ.get("YB_MINT_BACKEND", "cdp")  # cdp（默认，hea
 YB_COOKIE_FILE = os.environ.get("YB_COOKIE_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie.txt"))  # 默认凭证文件（无 bsk 数据面）
 YB_PROXY_URL = os.environ.get("YB_PROXY_URL", "")    # 单条代理（兼容）：http://host:port
 YB_PROXY_POOL = os.environ.get("YB_PROXY_POOL", "")   # 代理池（逗号分隔）：url1,url2,... 数据面逐请求轮换
+# 浏览器侧出口（entrypoint 用它起 socks_bridge）。与 YB_PROXY_URL 同值时 = 登录 IP == 使用 IP
+YB_BROWSER_PROXY = os.environ.get("YB_BROWSER_PROXY", "")
 _PROXY_BAD: dict = {}          # 代理 -> 冷却截止（失败后 60s 内跳过）
 _PROXY_IDX = 0
 
@@ -172,10 +176,110 @@ def _open(req, timeout: int = 300):
                 continue
             raise
     raise RuntimeError("代理池全部不可用且直连失败: " + " → ".join(order))
+
+
+class _RawResp:
+    """流式出站响应垫片（urllib HTTPResponse / requests Response 统一）。
+    契约：.status .headers .read() .iter_lines() -> bytes 行 .close()"""
+
+    def __init__(self, status, headers, reader=None, lines=None, close=None):
+        self.status = status
+        self.headers = headers
+        self._reader = reader
+        self._lines = lines
+        self._close = close
+
+    def read(self):
+        if self._reader is not None:
+            return self._reader.read()
+        if self._lines is None:
+            return b""
+        return b"".join(self.iter_lines())
+
+    def iter_lines(self):
+        """逐行产出 SSE 行（已剥离 CRLF），不等到 body 收完。"""
+        if self._lines is not None:
+            for ln in self._lines:
+                if isinstance(ln, (bytes, bytearray)):
+                    yield bytes(ln).rstrip(b"\r\n")
+                else:
+                    yield str(ln).rstrip("\r\n").encode("utf-8")
+            return
+        if self._reader is None:
+            return
+        while True:
+            ln = self._reader.readline()
+            if not ln:
+                break
+            yield ln.rstrip(b"\r\n")
+
+    def close(self):
+        try:
+            if self._close is not None:
+                self._close()
+            elif self._reader is not None and hasattr(self._reader, "close"):
+                self._reader.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        self.close()
+        return False
+
+
+def _open_socks_stream(req, proxy_url: str, timeout: int):
+    """socks5/socks5h 流式出站（requests stream=True；iter_lines 内部已解压）。"""
+    import requests
+    resp = requests.request(
+        req.get_method(), req.full_url, headers=dict(req.headers),
+        data=getattr(req, "data", None),
+        proxies={"http": proxy_url, "https": proxy_url},
+        timeout=timeout, verify=False, stream=True,
+    )
+    return _RawResp(resp.status_code, resp.headers,
+                    lines=resp.iter_lines(chunk_size=8192, decode_unicode=False),
+                    close=resp.close)
+
+
+def _open_stream(req, timeout: int = 300):
+    """流式出站（不预读 body）。与 _open 同款代理池轮换；
+    仅在"连不上"时换下一个/直连兜底，HTTP 4xx/5xx 原样返回（body 仍可流式读）。"""
+    order = []
+    pool = _proxy_list()
+    n = len(pool) or 1
+    for _ in range(n + 1):
+        pr = _proxy_next()
+        order.append(pr or "(直连)")
+        fresh = _ureq.Request(req.full_url, data=getattr(req, "data", None),
+                              headers=dict(req.headers), method=req.get_method())
+        try:
+            if pr and pr.split("://", 1)[0].lower().startswith("socks"):
+                return _open_socks_stream(fresh, pr, timeout)
+            handler = _ureq.ProxyHandler({"http": pr, "https": pr}) if pr else _ureq.ProxyHandler({})
+            try:
+                r = _ureq.build_opener(handler).open(fresh, timeout=timeout)
+            except _uerr.HTTPError as he:
+                r = he                      # 非 2xx 也是可流式读的响应
+            status = getattr(r, "status", None) or getattr(r, "code", 0)
+            return _RawResp(status, r.headers, reader=r, close=r.close)
+        except Exception:
+            if pr:
+                _proxy_mark_bad(pr, 60)
+                continue
+            raise
+    raise RuntimeError("代理池全部不可用且直连失败: " + " → ".join(order))
+
+
 YB_DATA_PLANE = os.environ.get("YB_DATA_PLANE", "auto")  # auto|page|cookie：auto=cdp 走页内、bsk 走页内+文件兜底
 YB_MINTER_URL = os.environ.get("YB_MINTER_URL", "")   # 远程 minter 服务（YB_MINT_BACKEND=http 时用）
 YB_MINTER_TOKEN = os.environ.get("YB_MINTER_TOKEN", "")  # minter 服务鉴权（X-Minter-Key）
 YB_MIN_INTERVAL = float(os.environ.get("YB_MIN_INTERVAL", "2"))  # 同凭证两请求最小间隔秒（限速）
+YB_MIN_JITTER = float(os.environ.get("YB_MIN_JITTER", "1.5"))     # 最小间隔之上再叠 0~N 秒随机（越像人越好）
+YB_WARMUP_DAYS = float(os.environ.get("YB_WARMUP_DAYS", "0"))     # 养号期：首次成功后的 N 天内禁生图（0=关闭）
+YB_DAILY_QUOTA = int(os.environ.get("YB_DAILY_QUOTA", "0"))       # 每实例每天最多 N 次生成类调用（0=不限）
 YB_SOFTRETRY = int(os.environ.get("YB_SOFTRETRY", "1"))   # 软拒("服务繁忙")自动退避重试次数
 PORT = int(os.environ.get("YUANBAO_PROXY_PORT", "8177"))
 
@@ -306,11 +410,17 @@ def _keepalive_probe_sync(cookie: str):
     h["Cookie"] = cookie
     req = _ureq.Request(KEEPALIVE_URL, headers=h, method="GET")
     try:
-        with _OPENER.open(req, timeout=30) as r:
-            return r.status, r.read().decode("utf-8", "ignore")[:200]
+        # 🔴 走 _open（本号固定出口），不要用 _OPENER 直连 ——
+        # 否则保活来自机房 IP、业务来自住宅 IP，"同一账号两个出口"本身就是异常信号
+        with _open(req, timeout=30) as r:
+            body = r.read().decode("utf-8", "ignore")[:300]
+            _note_ban(body)
+            return r.status, body[:200]
     except _uerr.HTTPError as e:
         try:
-            return e.code, e.read().decode("utf-8", "ignore")[:200]
+            body = e.read().decode("utf-8", "ignore")[:300]
+            _note_ban(body)
+            return e.code, body[:200]
         except Exception:
             return e.code, ""
     except Exception as e:
@@ -546,6 +656,22 @@ def _key_tag(request: Request) -> str:
     return "k" + hashlib.sha256(v.encode()).hexdigest()[:8]
 
 
+def _account_age_days() -> float:
+    """本实例账号「首次成功」至今的天数（没有成功过 → 0）。养号期护栏用。"""
+    try:
+        if ACCOUNT is None:
+            return 0.0
+        t = (ACCOUNT.get() or {}).get("first_ok_at")
+        if not t:
+            return 0.0
+        return max(0.0, (time.time() - float(t)) / 86400.0)
+    except Exception:
+        return 0.0
+
+
+GUARD = _guard.Guard(YB_WARMUP_DAYS, YB_DAILY_QUOTA, _account_age_days)
+
+
 def _mctx(**kw):
     c = _MCTX.get()
     if c is not None:
@@ -558,7 +684,9 @@ async def _metrics_mw(request: Request, call_next):
     if METRICS is None or not path.startswith("/v1/"):
         return await call_next(request)
     t0 = time.time()
-    ctx = {"endpoint": path, "model": None, "stream": False, "usage": None, "err": None}
+    ctx = {"endpoint": path, "model": None, "stream": False, "usage": None, "err": None,
+           "_t0": t0, "_client": (request.client.host if request.client else ""),
+           "_key": _key_tag(request), "_stream_owned": False}
     # 从请求体里取 model / stream（Starlette 会缓存 body，下游仍可正常读）
     try:
         if request.method == "POST" and "json" in (request.headers.get("content-type") or ""):
@@ -580,19 +708,20 @@ async def _metrics_mw(request: Request, call_next):
         raise
     finally:
         _MCTX.reset(tok)
-        try:
-            METRICS.record({
-                "ts": int(t0), "instance": YB_INSTANCE_NAME_ENV,
-                "endpoint": path, "model": ctx.get("model") or "?",
-                "status": status, "ok": 200 <= status < 300,
-                "ms": int((time.time() - t0) * 1000),
-                "stream": bool(ctx.get("stream")),
-                "usage": ctx.get("usage"), "err": ctx.get("err"),
-                "client": (request.client.host if request.client else ""),
-                "key": _key_tag(request),
-            })
-        except Exception:
-            pass
+        if not ctx.get("_stream_owned"):
+            try:
+                METRICS.record({
+                    "ts": int(t0), "instance": YB_INSTANCE_NAME_ENV,
+                    "endpoint": path, "model": ctx.get("model") or "?",
+                    "status": status, "ok": 200 <= status < 300,
+                    "ms": int((time.time() - t0) * 1000),
+                    "stream": bool(ctx.get("stream")),
+                    "usage": ctx.get("usage"), "err": ctx.get("err"),
+                    "client": ctx.get("_client") or "",
+                    "key": ctx.get("_key") or "anon",
+                })
+            except Exception:
+                pass
 
 
 # ---------------- 无水印保存（账号级开关，新号登录后自动开启） ----------------
@@ -615,13 +744,18 @@ def _wm_call(cookie: str, path: str, payload=None, method: str = "POST", cap: in
     data = json.dumps(payload).encode() if payload is not None else None
     req = _ureq.Request(WM_HOST + path, data=data, headers=h, method=method)
     try:
-        with _OPENER.open(req, timeout=30) as r:
+        # 与保活同理：走本号固定出口，避免"同账号多出口"
+        with _open(req, timeout=30) as r:
             # 🔴 不要截断得太狠：/api/info/general 的 graySwitches 很长，
             # 截到几百字符会 JSON 解析失败（曾导致 gray_ok 恒为 null）
-            return r.status, r.read().decode("utf-8", "ignore")[:cap]
+            body = r.read().decode("utf-8", "ignore")[:cap]
+            _note_ban(body)
+            return r.status, body
     except _uerr.HTTPError as e:
         try:
-            return e.code, e.read().decode("utf-8", "ignore")[:cap]
+            body = e.read().decode("utf-8", "ignore")[:cap]
+            _note_ban(body)
+            return e.code, body
         except Exception:
             return e.code, ""
     except Exception as e:
@@ -745,9 +879,13 @@ def _yb_post_json(cookie: str, path: str, body: dict, sig: Optional[dict], agent
                         headers=h, method="POST")
     try:
         with _open(req, timeout=timeout) as r:
-            return {"status": r.status, "text": r.read().decode("utf-8", "replace")}
+            _t = r.read().decode("utf-8", "replace")
+            _note_ban(_t)
+            return {"status": r.status, "text": _t}
     except _uerr.HTTPError as e:
-        return {"status": e.code, "text": e.read().decode("utf-8", "replace")}
+        _t = e.read().decode("utf-8", "replace")
+        _note_ban(_t)
+        return {"status": e.code, "text": _t}
 
 
 def _yb_upload_ref(cookie: str, agent_id: str, b64_data: str, name: str, mime: str) -> dict:
@@ -816,6 +954,62 @@ def _parse_yb_sse_common(text: str) -> dict:
         elif t == "error":
             error = obj.get("msg") or "服务繁忙"
     return {"urls": urls, "wmUrls": wm_urls, "text": "".join(text_parts), "error": error}
+
+
+def _yb_stream_open(cookie: str, path: str, body: dict, sig: Optional[dict], agent_id: str,
+                    conv: str = "", extra: Optional[dict] = None, timeout: int = 300):
+    """出站 POST /api/... 的**流式**版本：立刻返回 _RawResp，body 边到边读（真流式关键）。"""
+    h = _yb_headers(cookie, sig, agent_id, conv, extra)
+    h["Accept-Encoding"] = "identity"     # 禁止 gzip，避免代理层缓冲住 SSE 分片
+    req = _ureq.Request("https://yuanbao.tencent.com" + path,
+                        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                        headers=h, method="POST")
+    return _open_stream(req, timeout=timeout)
+
+
+def _yb_line_event(line) -> Optional[dict]:
+    """元宝 SSE 单行 → 归一化事件 {kind: text|think|meta|error|image, ...}（None=忽略）。"""
+    s = line.decode("utf-8", "replace") if isinstance(line, (bytes, bytearray)) else str(line)
+    s = s.strip()
+    if not s:
+        return None
+    if s.startswith("event: error"):
+        return {"kind": "error", "msg": "元宝返回错误事件"}
+    if not s.startswith("data: "):
+        return None
+    payload = s[6:].strip()
+    if payload == "[DONE]" or not payload.startswith("{"):
+        return None
+    try:
+        obj = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    t = obj.get("type")
+    if t == "text" and obj.get("msg") is not None:
+        return {"kind": "text", "msg": obj["msg"]}
+    if t == "think" and obj.get("msg") is not None:
+        return {"kind": "think", "msg": obj["msg"]}
+    if t == "meta":
+        tok = obj.get("tokenUsageInfo") or {}
+        ev = {"kind": "meta", "usage": {
+            "prompt_tokens": tok.get("promptTokens", 0),
+            "completion_tokens": tok.get("completionTokens", 0),
+            "total_tokens": tok.get("totalTokens", 0),
+        }}
+        if obj.get("modelErrorCode"):
+            ev["error"] = obj.get("modelErrorMsg") or ("modelErrorCode=%s" % obj["modelErrorCode"])
+        return ev
+    if t == "error":
+        return {"kind": "error", "msg": obj.get("msg") or "服务繁忙"}
+    if t == "replace" and (obj.get("replace") or {}).get("multimedias"):
+        ms = obj["replace"]["multimedias"]
+        return {"kind": "image",
+                "urls": [m.get("originUrl") or m.get("url") for m in ms if m.get("url")],
+                "wmUrls": [m.get("url") for m in ms if m.get("url")]}
+    return None
+
 
 # ---------------- bsk 桥接 ----------------
 _bsk_lock = threading.Lock()
@@ -1031,9 +1225,14 @@ def get_sig(tab: str, force: bool = False) -> dict:
 
 
 def pace(key: str):
-    """同凭证限速：距上次请求不足 YB_MIN_INTERVAL 则等待。"""
+    """同凭证限速：最小间隔 YB_MIN_INTERVAL + 0~YB_MIN_JITTER 随机抖动。
+
+    为什么加抖动：固定 2s 的等距请求是最容易被识别的脚本特征之一；
+    人类操作间隔是长尾分布，加随机后每条连接的时间指纹就不再可疑。
+    """
+    target = _guard.pace_seconds(YB_MIN_INTERVAL, YB_MIN_JITTER)
     last = _last_req_at.get(key, 0)
-    wait = YB_MIN_INTERVAL - (time.time() - last)
+    wait = target - (time.time() - last)
     if wait > 0:
         time.sleep(wait)
     _last_req_at[key] = time.time()
@@ -1567,7 +1766,239 @@ def _cookie_mode_run(cookie: str, agent_id: str, prompt: str, chat_model: str,
         return result
 
 
+def _cookie_mode_stream(cookie: str, agent_id: str, prompt: str, chat_model: str,
+                        tab: Optional[str] = None, timeout: int = 300):
+    """真流式（透传模式 · 纯文本聊天）：边收元宝 SSE 边产出事件。
+
+    产出事件（dict）：
+      {"delta": {"content"|"reasoning_content": str}}   # 正文/思维链增量
+      {"usage": {...}}                                  # meta 事件（末尾一条）
+      {"error": str, "status": int?}                    # 失败（软拒/401/中斷）
+      {"finish": "stop"}                                # 正常结束
+    本次创建的会话在结束（含客户端中断触发 GeneratorExit）时统一删除。
+    软拒（"服务繁忙"）且**尚无内容产出**时退避重试（重铸签名）。"""
+    pace("ck:" + cookie[:16])
+    if tab is None and YB_MINT_BACKEND != "cdp":
+        tab = _ensure_page()["tabId"]
+    for attempt in range(YB_SOFTRETRY + 1):
+        with _bsk_lock:
+            sig = get_sig(tab, force=attempt > 0)
+        conv, created = None, False
+        if YUANBAO_CONVERSATION:
+            conv = YUANBAO_CONVERSATION
+        elif YB_CREATE_CONV == "1":
+            r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
+                              {"agentId": agent_id}, sig, agent_id)
+            if r["status"] != 200:
+                yield {"error": ("元宝凭证失效（HTTP 401）" if r["status"] == 401
+                                 else "创建会话失败 HTTP %d" % r["status"]),
+                       "status": r["status"]}
+                return
+            try:
+                conv = json.loads(r["text"]).get("id")
+            except Exception:
+                conv = None
+            if not conv:
+                yield {"error": "创建会话失败: " + r["text"][:150]}
+                return
+            created = True
+        else:
+            conv = str(uuid.uuid4())
+            created = True
+
+        emitted, err, status, retryable = False, None, 200, False
+        body = _yb_chat_body(conv, agent_id, prompt, chat_model)
+        try:
+            resp = _yb_stream_open(cookie, "/api/chat/%s" % conv, body, sig, agent_id, conv, timeout=timeout)
+        except Exception as e:
+            resp, err, status, retryable = None, ("上游连接失败: %s" % (str(e)[:160])), 502, True
+        if resp is not None:
+            status = resp.status or 0
+            if status != 200:
+                try:
+                    detail = resp.read().decode("utf-8", "replace")[:200]
+                except Exception:
+                    detail = ""
+                finally:
+                    resp.close()
+                err = ("元宝凭证失效（HTTP 401）" if status == 401
+                       else "元宝 HTTP %d %s" % (status, detail))
+                # 🔴 只对 5xx / 429 重试；401/403/400 是确定性失败，重试纯属白等（实测 +2s 退避）
+                retryable = status >= 500 or status == 429
+            else:
+                try:
+                    for line in resp.iter_lines():
+                        ev = _yb_line_event(line)
+                        if not ev:
+                            continue
+                        kind = ev["kind"]
+                        if kind == "text":
+                            emitted = True
+                            yield {"delta": {"content": ev["msg"]}}
+                        elif kind == "think":
+                            yield {"delta": {"reasoning_content": ev["msg"]}}
+                        elif kind == "meta":
+                            if ev.get("usage"):
+                                yield {"usage": ev["usage"]}
+                            if ev.get("error"):
+                                err = ev["error"]
+                        elif kind == "error":
+                            err = ev["msg"]
+                            # 封号是确定性失败，重试没意义（_note_ban 同时会剔除该号）
+                            retryable = not _note_ban(ev["msg"])
+                except GeneratorExit:
+                    raise
+                except Exception as e:
+                    err = err or ("上游流中断: %s" % (str(e)[:160]))
+                    retryable = retryable or not emitted   # 已有正文就不再重试
+                finally:
+                    resp.close()
+        if created and YB_DELETE_CONV == "1":
+            try:
+                _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
+                              {"cid": conv}, sig, agent_id, timeout=30)
+            except Exception:
+                pass
+
+        if err and retryable and not emitted and attempt < YB_SOFTRETRY:
+            time.sleep(2.0 * (attempt + 1))
+            continue
+        if err:
+            yield {"error": err, "status": status}
+        else:
+            yield {"finish": "stop"}
+        return
+
+
+def _live_chat_sse(mctx, cookie: str, agent_id: str, prompt: str, chat_model: str,
+                   tab, comp_id: str, created: int, model_in: str):
+    """把 _cookie_mode_stream 的事件流翻成 OpenAI chat.completion.chunk SSE（真流式转发）。"""
+    usage_seen, err_seen, status, emitted = None, None, 200, False
+    try:
+        for ev in _cookie_mode_stream(cookie, agent_id, prompt, chat_model, tab=tab):
+            if "delta" in ev:
+                if ev["delta"].get("content"):
+                    emitted = True
+                obj = {"id": comp_id, "object": "chat.completion.chunk", "created": created,
+                       "model": model_in, "choices": [{"index": 0, "delta": ev["delta"]}]}
+                yield "data: %s\n\n" % json.dumps(obj, ensure_ascii=False)
+            elif "usage" in ev:
+                usage_seen = ev["usage"]
+            elif ev.get("error"):
+                err_seen = ev["error"]
+                status = ev.get("status") or 502
+            elif "finish" in ev:
+                done = {"id": comp_id, "object": "chat.completion.chunk", "created": created,
+                        "model": model_in,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": ev["finish"]}]}
+                yield "data: %s\n\n" % json.dumps(done, ensure_ascii=False)
+    except GeneratorExit:
+        raise
+    except Exception as e:
+        err_seen = err_seen or ("流式转发异常: %s" % (str(e)[:200]))
+        status = 502
+        print("[stream] 异常: %r" % (e,), flush=True)
+
+    if err_seen and not emitted:
+        # 内容零产出 → 直接给一条 OpenAI 风格 error 分片（客户端会据此报错）
+        yield "data: %s\n\n" % json.dumps(
+            {"error": {"message": err_seen, "type": "api_error"}}, ensure_ascii=False)
+    elif err_seen:
+        done = {"id": comp_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_in, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]}
+        yield "data: %s\n\n" % json.dumps(done, ensure_ascii=False)
+    if usage_seen:
+        uobj = {"id": comp_id, "object": "chat.completion.chunk", "created": created,
+                "model": model_in, "choices": [], "usage": usage_seen}
+        yield "data: %s\n\n" % json.dumps(uobj, ensure_ascii=False)
+    yield "data: [DONE]\n\n"
+
+    if mctx is not None:
+        mctx["usage"] = usage_seen
+        mctx["err"] = err_seen
+    _metrics_finalize(mctx, 200 if (not err_seen or emitted) else status)
+
+
+def _metrics_finalize(ctx, status: int = 200):
+    """流式响应由生成器自己落统计（middleware 在 body 消费前就返回了，拿不到 usage）。"""
+    if METRICS is None or ctx is None:
+        return
+    try:
+        t0 = ctx.get("_t0") or time.time()
+        METRICS.record({
+            "ts": int(t0), "instance": YB_INSTANCE_NAME_ENV,
+            "endpoint": ctx.get("endpoint"), "model": ctx.get("model") or "?",
+            "status": status, "ok": 200 <= status < 300,
+            "ms": int((time.time() - t0) * 1000),
+            "stream": True,
+            "usage": ctx.get("usage"), "err": ctx.get("err"),
+            "client": ctx.get("_client") or "", "key": ctx.get("_key") or "anon",
+        })
+    except Exception:
+        pass
+
+
 # ---------------- 元宝调用封装 ----------------
+def _note_ban(*texts) -> bool:
+    """识别上游「用户被封号」（错误码 20004）→ 立即把该号**剔除**。
+
+    为什么用 eject 而不是 quarantine：
+      冻结/封号是**账号级、确定性**的（页面上写着"您的账号有违规行为"，需人工申诉），
+      不会因为再保活几次就恢复。留在隔离态只会让轮询反复打到死号上、日志刷错误。
+      eject 后不参与轮询，也**不会被"连续成功自动恢复"翻回来**（人工 restore 才回池）。
+    """
+    blob = " ".join(str(t) for t in texts if t)
+    if not blob:
+        return False
+    # 实测两种文案：{"code":"20004","message":"用户被封号"} 与 {"code":"20004","message":"user forbidden"}
+    # ⇒ 以**错误码**为准，不依赖中文文案
+    if "20004" not in blob and "用户被封号" not in blob:
+        return False
+    if ACCOUNT is not None:
+        try:
+            ACCOUNT.apply("eject", "上游 20004 用户被封号（自动剔除，需申诉解封）", by="auto")
+            print("[ban] 检测到 20004 用户被封号 → 已自动剔除该号", flush=True)
+        except Exception:
+            pass
+    return True
+
+
+def _cookie_ban_probe(cookie: str, agent_id: str = "naQivTmsDa") -> dict:
+    """用一次 conversation/create 验证 cookie 真实可用性。
+
+    为什么必须建会话才能验：`GET /api/info/general` 对**已封号**的账号仍然返回 200
+    ⇒ "探活 alive" 是假象，真正的封号信号（20004）只在建会话时冒出来。
+    返回 {"ok","banned","status","detail"}；验完立刻删掉这次建的会话。
+    """
+    try:
+        sig = get_sig(None)
+    except Exception:
+        sig = None            # 铸签失败不阻塞判定（退化为"未知"，不当封号处理）
+    try:
+        r = _yb_post_json(cookie, "/api/user/agent/conversation/create",
+                          {"agentId": agent_id}, sig, agent_id, timeout=40)
+    except Exception as e:
+        return {"ok": False, "banned": False, "status": 0, "detail": "请求失败: %s" % str(e)[:100]}
+    txt = r.get("text") or ""
+    if "20004" in txt or "用户被封号" in txt:
+        return {"ok": False, "banned": True, "status": r.get("status"), "detail": "20004 用户被封号"}
+    if r.get("status") != 200:
+        return {"ok": False, "banned": False, "status": r.get("status"),
+                "detail": "HTTP %s %s" % (r.get("status"), txt[:100])}
+    try:
+        conv = json.loads(txt).get("id")
+    except Exception:
+        conv = None
+    if conv:
+        try:
+            _yb_post_json(cookie, "/api/user/agent/conversation/v1/delete",
+                          {"cid": conv}, sig, agent_id, timeout=20)
+        except Exception:
+            pass
+        return {"ok": True, "banned": False, "status": 200, "detail": "ok"}
+    return {"ok": False, "banned": False, "status": 200, "detail": "建会话无 id: " + txt[:100]}
+
+
 def _yb_auth_error(result: dict):
     """上游 401 → 明确的凭证过期错误（透传模式常见 = hy_token/hy_user 失效，需重新抓 cookie）。"""
     if isinstance(result, dict) and result.get("status") == 401:
@@ -1873,13 +2304,81 @@ async def admin_state(req: Request):
     if (YB_AUTO_WATERMARK and st.get("logged_in") and not st.get("frozen")
             and not _WM_RUNNING and time.time() - _WATERMARK.get("at", 0) > 60):
         asyncio.create_task(_watermark_auto())
+    # 页内已显示"账号已冻结" ⇒ 立刻落状态机（隔离）。
+    # 不能指望保活来发现：/api/info/general 对冻结号**仍可能返回 200**，
+    # 冻结只在创建会话时才报 20004 —— 所以这里以页面事实为准。
+    if st.get("frozen") and ACCOUNT is not None:
+        _lh = ACCOUNT.get().get("last_health") or {}
+        if not _lh.get("frozen"):
+            try:
+                ACCOUNT.record_health(False, None, "页内显示：账号已冻结（违规行为，需申诉）", True,
+                                      count_failure=False)
+                print("[pool_state] 检测到页内冻结 → 已隔离", flush=True)
+            except Exception:
+                pass
     # 已登录但还没有过成功保活 → 立刻补一次，使该号尽快具备被轮询的资格
     if (st.get("logged_in") and not st.get("frozen") and ACCOUNT is not None
             and not (ACCOUNT.get().get("last_health") or {}).get("ok")
             and time.time() - _KEEPALIVE.get("at", 0) > 20):
         asyncio.create_task(_keepalive_probe_now())
     return {"result": st, "keepalive": _KEEPALIVE, "watermark": _WATERMARK,
-            "account": (ACCOUNT.get() if ACCOUNT else None)}
+            "account": (ACCOUNT.get() if ACCOUNT else None),
+            "guard": GUARD.snapshot()}
+
+
+@app.get("/admin/egress")
+async def admin_egress(req: Request):
+    """出口自检：**数据面出口 IP vs 浏览器出口 IP**。
+
+    为什么必须有这个端点：反风控里最贵的错误是"登录时一个 IP、使用请求从另一个 IP 发出"。
+    配了固定单出口（YB_PROXY_URL + YB_BROWSER_PROXY 同值、YB_PROXY_POOL 为空）时这里应看到
+    data_ip == browser_ip == match:true。
+    """
+    cred = _check_admin_panel_auth(req)
+    if isinstance(cred, JSONResponse):
+        return cred
+
+    def _mask(u: str) -> str:
+        if not u:
+            return ""
+        if "@" in u:
+            head, _, tail = u.rpartition("@")
+            scheme, _, cred_part = head.rpartition("://")
+            return "%s://%s:***@%s" % (scheme or "socks5h", cred_part.split(":")[0], tail)
+        return u
+
+    pool = _proxy_list()
+    out = {"egress_mode": ("固定单出口" if len(pool) <= 1 else "池(%d)" % len(pool)),
+           "proxy": _mask(pool[0] if len(pool) == 1 else (YB_PROXY_POOL or "")),
+           "browser_proxy": _mask(YB_BROWSER_PROXY),
+           "data_ip": None, "browser_ip": None, "match": None}
+
+    try:
+        rq = _ureq.Request("https://api.ipify.org")
+        with _open(rq, timeout=25) as r:
+            out["data_ip"] = r.read().decode("utf-8", "replace").strip()
+    except Exception as e:
+        out["data_ip"] = "ERR: %s" % str(e)[:120]
+
+    if YB_MINT_BACKEND == "cdp":
+        try:
+            import cdp_minter
+            m = cdp_minter.get_minter()
+            ip = await asyncio.to_thread(m.evaluate, "fetch('https://api.ipify.org').then(r=>r.text())", 45)
+            out["browser_ip"] = (ip or "").strip() or None
+        except Exception as e:
+            out["browser_ip"] = "ERR: %s" % str(e)[:120]
+
+    ok = bool(out["data_ip"] and out["browser_ip"]
+              and out["data_ip"] == out["browser_ip"])
+    out["match"] = ok
+    if ok:
+        out["verdict"] = "✅ 数据面与浏览器同出口"
+    elif isinstance(out["data_ip"], str) and out["data_ip"].startswith("ERR"):
+        out["verdict"] = "⚠️ 数据面探不通（代理/网络异常）"
+    else:
+        out["verdict"] = "⚠️ 出口不一致：登录 IP ≠ 使用 IP，风控会当成异常"
+    return {"result": out, "guard": GUARD.snapshot()}
 
 
 @app.api_route("/admin/keepalive", methods=["GET", "POST"])
@@ -2348,6 +2847,10 @@ async def admin_group_op(req: Request):
             while ("yb%02d" % i) in existing:
                 i += 1
             name = "yb%02d" % i
+        _pb = await asyncio.to_thread(_cookie_ban_probe, cookie)
+        if _pb.get("banned"):
+            return JSONResponse({"error": "该号已被封（%s），存进来也用不了 —— 请换一个干净的微信号后再扫。"
+                                          % _pb.get("detail"), "type": "invalid_request_error"}, status_code=400)
         r = COOKIE_ACCOUNTS.add(name, cookie, note)
         if not r.get("ok"):
             return JSONResponse({"error": r.get("error")}, status_code=400)
@@ -2377,6 +2880,10 @@ async def admin_group_op(req: Request):
             while ("yb%02d" % i) in existing:
                 i += 1
             name = "yb%02d" % i
+        _pb = await asyncio.to_thread(_cookie_ban_probe, cookie)
+        if _pb.get("banned"):
+            return JSONResponse({"error": "该号已被封（%s），加进来也用不了 —— 请换一个干净的号再抓 cookie。"
+                                          % _pb.get("detail"), "type": "invalid_request_error"}, status_code=400)
         r = COOKIE_ACCOUNTS.add(name, cookie, note)
         if not r.get("ok"):
             return JSONResponse({"error": r.get("error")}, status_code=400)
@@ -3933,10 +4440,33 @@ async def chat_completions(req: Request):
     if unwm and not image_refs:
         return JSONResponse({"error": {"message": "去水印需要提供图片：messages 里带 image_url", "type": "invalid_request_error"}}, status_code=400)
 
+
     created = int(time.time())
     comp_id = "chatcmpl-" + uuid.uuid4().hex[:24]
     # hy-image-* / dall-e-* 生图模型：chat 门直接走生图管道（无图 t2i，带图 i2i）
     image_flow = bool(image_refs) or (_is_image_model(model_in) and not unwm)
+
+    # ---- 护栏：养号期禁生图 / 每日配额（必须放在 image_flow 之后；放前面会 UnboundLocalError）----
+    _g = GUARD.check("image" if (image_flow or unwm) else "chat")
+    if _g:
+        print("[guard] 拒绝 %s: %s" % (_g["error"].get("code"), _g["error"].get("message", "")[:80]), flush=True)
+        return JSONResponse(_g["error"], status_code=_g["status"])
+    GUARD.note()
+
+    # ---- 真流式优先：透传模式 · 纯文本聊天（边收元宝 SSE 边转发，首字节 ~1s）----
+    if stream and cookie_str and not image_flow and not unwm:
+        if YB_MINT_BACKEND == "cdp":
+            _tab, _agent = None, "naQivTmsDa"
+        else:
+            _pg = _ensure_page()
+            _tab, _agent = _pg["tabId"], _pg["agentId"]
+        _m = _MCTX.get()
+        if _m is not None:
+            _m["_stream_owned"] = True
+        return StreamingResponse(
+            _live_chat_sse(_m, cookie_str, _agent, prompt, chat_model, _tab, comp_id, created, model_in),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     conv_created = None  # 本次新建的会话（用完即删）
     try:
@@ -4030,6 +4560,7 @@ async def chat_completions(req: Request):
     except Exception as e:
         import traceback
         traceback.print_exc()
+        _note_ban(e)   # 页内报 "20004 用户被封号" 时立即剔除该号
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
 
     # 用完即删（浏览器模式）：历史零残留
@@ -4196,6 +4727,13 @@ async def images_generations(req: Request):
     n = min(int(body.get("n", 1) or 1), 4)
     resolution = _size_to_resolution(body.get("size", ""))
 
+    # ---- 护栏：生图一律按 image 计（养号期直接挡掉）----
+    _g = GUARD.check("image")
+    if _g:
+        print("[guard] 拒绝生图: %s" % _g["error"].get("code"), flush=True)
+        return JSONResponse(_g["error"], status_code=_g["status"])
+    GUARD.note()
+
     created = int(time.time())
     conv_created = None
     try:
@@ -4248,6 +4786,7 @@ async def images_generations(req: Request):
                         timeout=300,
                     )
     except Exception as e:
+        _note_ban(e)
         return JSONResponse({"error": {"message": f"浏览器桥接失败: {e}", "type": "api_error"}}, status_code=502)
 
     # 用完即删（浏览器模式）：历史零残留

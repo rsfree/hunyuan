@@ -138,8 +138,22 @@ class AccountState:
         with self._lock:
             self._d["last_health"] = {"at": int(time.time()), "ok": bool(ok), "status": status,
                                       "detail": detail[:200], "frozen": bool(frozen)}
+            # 🔴 冻结优先于"新号不计失败"：被冻结的号不管有没有成功过，都必须立刻隔离。
+            # （否则 add-account 出来的新号第一次就被冻结会一直停留在 enabled）
+            if frozen and self._d["state"] in ("enabled", "quarantined"):
+                self._d.update({"state": "quarantined", "reason": "账号被冻结（自动隔离）",
+                                "changed_at": int(time.time()), "changed_by": "auto"})
+                self._log("quarantine", "账号被冻结", "auto")
+                self._save()
+                d = json.loads(json.dumps(self._d))
+                d["label"] = LABELS.get(d["state"], d["state"])
+                d["routable"] = d["state"] == "enabled"
+                return d, "quarantine:frozen"
+
             if ok:
                 self._d["ever_ok"] = True
+                if not self._d.get("first_ok_at"):
+                    self._d["first_ok_at"] = int(time.time())   # 养号期的起点
             elif (not count_failure) or (not self._d.get("ever_ok")):
                 # 🔴 从未成功过（＝还没扫码登录过的新实例）不计失败、不自动隔离。
                 # 否则刚 add-account 出来的号会在 3 个保活周期后被误隔离，反而更难上手。
@@ -156,14 +170,9 @@ class AccountState:
                 self._d["ok_streak"] = 0
 
             st = self._d["state"]
-            # 1) 冻结 → 立即自动隔离
-            if frozen and st in ("enabled", "quarantined"):
-                self._d.update({"state": "quarantined", "reason": "账号被冻结（自动隔离）",
-                                "changed_at": int(time.time()), "changed_by": "auto"})
-                self._log("quarantine", "账号被冻结", "auto")
-                act = "quarantine:frozen"
+            # 1) 冻结已在函数开头提前返回处理（见上方 frozen 分支）
             # 2) 连续失败达阈值 → 自动隔离（只动 enabled，不覆盖手动 disabled/ejected）
-            elif (not ok and st == "enabled"
+            if (not ok and st == "enabled"
                   and self._d["fail_streak"] >= self.auto_disable_after):
                 self._d.update({"state": "quarantined",
                                 "reason": "保活连续失败 %d 次（自动隔离）" % self._d["fail_streak"],

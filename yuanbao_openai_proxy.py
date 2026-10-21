@@ -3418,9 +3418,12 @@ async def pool_router(req: Request, rest: str):
 
         # 同步生成器：Starlette 会自动放到线程池迭代，不会阻塞事件循环
         _oh = {"X-YB-Routed-To": str(t.get("name"))}
-        _up_hdr = up.headers.get("X-YB-Upscale") or up.headers.get("x-yb-upscale")
-        if _up_hdr:
-            _oh["X-YB-Upscale"] = _up_hdr      # 让客户端经轮询入口也能看到放大结果
+        # 透传上游所有 X-YB-* 头（放大结果 / mask 警告 / 以后新增的诊断头），
+        # 🔴 不要只挑固定的几个 —— 漏一个就是"直连有、轮询没有"的静默差异（mask 警告就这样丢过）
+        for _k, _v in (up.headers or {}).items():
+            _kl = str(_k).lower()
+            if _kl.startswith("x-yb-") and _kl != "x-yb-routed-to":
+                _oh[_k] = _v
         return StreamingResponse(gen(), status_code=up.status_code,
                                  media_type=up.headers.get("content-type", "application/json"),
                                  headers=_oh)

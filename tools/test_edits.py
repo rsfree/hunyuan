@@ -292,8 +292,19 @@ def e6():
     check("E6 注册 /v1/images/edits", '@app.post("/v1/images/edits")' in src)
 
 
+def e7():
+    print("[E7] 轮询入口透传所有 X-YB-* 头")
+    src = open(os.path.join(ROOT, "yuanbao_openai_proxy.py"), encoding="utf-8").read()
+    # 必须按前缀通配透传，不能只挑固定的几个（mask 警告就这样经轮询丢过）
+    check("E7 按 x-yb- 前缀透传", 'startswith("x-yb-")' in src)
+    check("E7 排除 routed-to（避免被上游覆盖）", '"x-yb-routed-to"' in src)
+    # 不要再出现"只挑 upscale 一个"的写法
+    check("E7 没有硬编码只透传 upscale",
+          'up.headers.get("X-YB-Upscale")' not in src, "说明还是单点透传，新头会漏")
+
+
 if __name__ == "__main__":
-    e1(); e2(); e3(); e4(); e5(); e6()
+    e1(); e2(); e3(); e4(); e5(); e6(); e7()
     print()
     if FAILS:
         print("FAILED %d: %s" % (len(FAILS), FAILS))
